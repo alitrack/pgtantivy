@@ -2,6 +2,8 @@
 // Seam B prototype: tantivy BM25 + jieba tokenization in a pgrx extension.
 // MIT. No ParadeDB code — clean-room, architecture-inspired only.
 use pgrx::prelude::*;
+use pgrx::pgbox::WhoAllocated;
+use pgrx::callbacks::{register_xact_callback, PgXactCallbackEvent};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -357,6 +359,160 @@ fn pgtantivy_remove(
     idx.reader.reload()?;
     Ok(format!("pgtantivy: {} id(s) removed from '{}'", n, name))
 }
+
+// ─── trigger auto-sync: buffer DML, flush once at PRE_COMMIT ───────────────
+// One tantivy commit per transaction (not per row): a 1000-row INSERT makes
+// one segment, not a thousand. Buffer is per-transaction state; the
+// PRE_COMMIT callback (registered lazily on first buffered op) flushes all
+// pending ops to their indexes; ABORT drops the buffer without touching disk.
+
+enum PendingOp {
+    Upsert { index: String, id: i64, text: String },
+    Delete { index: String, id: i64 },
+}
+
+fn pending_ops() -> &'static Mutex<Vec<PendingOp>> {
+    static P: OnceLock<Mutex<Vec<PendingOp>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Flush all buffered ops: called exactly once per transaction at PRE_COMMIT.
+fn flush_pending() {
+    let ops = {
+        let mut g = match pending_ops().lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        std::mem::take(&mut *g)
+    };
+    if ops.is_empty() {
+        return;
+    }
+    // group by index: one writer+commit per index
+    use std::collections::BTreeMap;
+    let mut by_index: BTreeMap<String, Vec<PendingOp>> = BTreeMap::new();
+    for op in ops {
+        let k = match &op {
+            PendingOp::Upsert { index, .. } => index.clone(),
+            PendingOp::Delete { index, .. } => index.clone(),
+        };
+        by_index.entry(k).or_default().push(op);
+    }
+    for (name, group) in by_index {
+        let idx = match registry().lock().ok().and_then(|r| r.get(&name).cloned()) {
+            Some(i) => i,
+            None => {
+                warning!("pgtantivy sync: index '{name}' not loaded; {} op(s) skipped", group.len());
+                continue;
+            }
+        };
+        let mut writer = match idx
+            .index
+            .writer::<tantivy::TantivyDocument>(32 * 1024 * 1024)
+        {
+            Ok(w) => w,
+            Err(e) => {
+                warning!("pgtantivy sync: writer for '{name}' failed: {e}");
+                continue;
+            }
+        };
+        for op in &group {
+            match op {
+                PendingOp::Upsert { id, text, .. } => {
+                    let _ = writer
+                        .delete_term(tantivy::Term::from_field_i64(idx.id, *id));
+                    let text_nfc = nfc(text);
+                    let _ = writer.add_document(doc!(
+                        idx.id => *id,
+                        idx.body => text_nfc.as_str()
+                    ));
+                }
+                PendingOp::Delete { id, .. } => {
+                    let _ = writer.delete_term(tantivy::Term::from_field_i64(idx.id, *id));
+                }
+            }
+        }
+        if let Err(e) = writer.commit() {
+            warning!("pgtantivy sync: commit for '{name}' failed: {e}");
+            continue;
+        }
+        drop(writer);
+        let _ = idx.reader.reload();
+    }
+}
+
+/// Drop all buffered ops (xact ABORT).
+fn discard_pending() {
+    let mut g = match pending_ops().lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    g.clear();
+}
+
+/// Row-level trigger: pgtantivy_sync_trigger() — attach with
+///   CREATE TRIGGER ... EXECUTE PROCEDURE pgtantivy_sync_trigger();
+/// Trigger args: (index_name, id_column [, text_column = 'body'])
+/// Buffers INSERT/UPDATE/DELETE ops; a PRE_COMMIT callback flushes them
+/// in one tantivy commit per index.
+#[pg_trigger]
+#[allow(clippy::type_complexity)]
+fn pgtantivy_sync_trigger<'a>(
+    trigger: &'a PgTrigger<'a>,
+) -> Result<Option<PgHeapTuple<'a, impl WhoAllocated>>, Box<dyn std::error::Error>> {
+    use pgrx::trigger_support::PgTriggerOperation::*;
+    let args = trigger.extra_args()?;
+    if args.len() < 2 {
+        let e: Box<dyn std::error::Error> =
+            "pgtantivy sync trigger needs args: (index_name, id_column [, text_column])".into();
+        return Err(e);
+    }
+    let index = args[0].clone();
+    let id_col = args[1].clone();
+    let text_col = args.get(2).cloned().unwrap_or_else(|| "body".into());
+
+    let op = trigger.op()?;
+    let mut guard = pending_ops()
+        .lock()
+        .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+    match op {
+        Insert | Update => {
+            let new = trigger.new().ok_or::<Box<dyn std::error::Error>>(
+                "pgtantivy sync: INSERT/UPDATE trigger has no NEW row".into(),
+            )?;
+            let id: i64 = new
+                .get_by_name::<i64>(&id_col)
+                .map_err(|e| format!("pgtantivy sync: id col '{id_col}': {e}"))?
+                .ok_or_else(|| format!("pgtantivy sync: NEW row lacks '{id_col}'"))?;
+            let text: String = new
+                .get_by_name::<String>(&text_col)
+                .map_err(|e| format!("pgtantivy sync: text col '{text_col}': {e}"))?
+                .ok_or_else(|| format!("pgtantivy sync: NEW row lacks '{text_col}'"))?;
+            guard.push(PendingOp::Upsert { index, id, text });
+        }
+        Delete => {
+            let old = trigger.old().ok_or::<Box<dyn std::error::Error>>(
+                "pgtantivy sync: DELETE trigger has no OLD row".into(),
+            )?;
+            let id: i64 = old
+                .get_by_name::<i64>(&id_col)
+                .map_err(|e| format!("pgtantivy sync: id col '{id_col}': {e}"))?
+                .ok_or_else(|| format!("pgtantivy sync: OLD row lacks '{id_col}'"))?;
+            guard.push(PendingOp::Delete { index, id });
+        }
+        _ => {}
+    }
+    drop(guard);
+    // lazy one-shot: flush at PRE_COMMIT, drop buffer on ABORT (the static
+    // buffer outlives the transaction, so it must be drained explicitly —
+    // otherwise rolled-back ops leak into the next transaction's flush)
+    register_xact_callback(PgXactCallbackEvent::PreCommit, flush_pending);
+    register_xact_callback(PgXactCallbackEvent::Abort, discard_pending);
+    Ok(None as Option<PgHeapTuple<'a, pgrx::pgbox::AllocatedByPostgres>>)
+}
+
+// impl Error for PgTriggerError so Box<dyn Error> works with `?` on trigger.op()/extra_args()
+// (PgTriggerError implements std::error::Error in pgrx 0.13; nothing needed here).
 
 /// List indexes: on-disk (with loaded flag) — one row per index dir.
 #[pg_extern]
