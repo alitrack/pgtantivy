@@ -23,6 +23,8 @@ use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use unicode_normalization::UnicodeNormalization;
 pg_module_magic!();
 
+pub mod am;
+
 // GUC pgtantivy.index_dir: where persistent indexes live. Empty (the
 // default) resolves to $PGDATA/pgtantivy.
 static INDEX_DIR_GUC: GucSetting<Option<&'static CStr>> = GucSetting::<Option<&'static CStr>>::new(None);
@@ -36,6 +38,7 @@ static MERGE_THRESHOLD_GUC: GucSetting<i32> = GucSetting::<i32>::new(8);
 #[no_mangle]
 #[pg_guard]
 pub unsafe extern "C" fn _PG_init() {
+    am::init_reloptions();
     GucRegistry::define_string_guc(
         "pgtantivy.index_dir",
         "Base directory for persistent pgtantivy indexes",
