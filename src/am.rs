@@ -11,11 +11,45 @@
 //! Storage remains the v0.2 sidecar layout under $PGDATA/pgtantivy/<name>/.
 //! WAL/recovery contract unchanged (documented: REINDEX after crash).
 
-use crate::{index_root, nfc, registry, PgIndex, JIEBA_TOKENIZER, analyzer};
+use crate::{index_root, lookup, nfc, registry, sanitize, PgIndex, JIEBA_TOKENIZER, analyzer};
+use tantivy::collector::TopDocs;
+use tantivy::query::QueryParser;
 use pgrx::prelude::*;
-use tantivy::schema::{IndexRecordOption, TextFieldIndexing, TextOptions, INDEXED, STORED, FAST};
+use tantivy::schema::{IndexRecordOption, TextFieldIndexing, TextOptions, Value, INDEXED, STORED, FAST};
 
 // ── handler ──────────────────────────────────────────────────────────────
+
+/// Minimal cost model: query-agnostic constant — BM25 top-N on a tantivy
+/// sidecar is sub-ms regardless of table size (mmap + inverted index).
+unsafe extern "C" fn amcostestimate(
+    _root: *mut pg_sys::PlannerInfo,
+    _path: *mut pg_sys::IndexPath,
+    _loop_count: f64,
+    index_startup_cost: *mut pg_sys::Cost,
+    index_total_cost: *mut pg_sys::Cost,
+    index_selectivity: *mut pg_sys::Selectivity,
+    index_correlation: *mut f64,
+    index_pages: *mut f64,
+) {
+    *index_startup_cost = 0.01;
+    *index_total_cost = 1.0;
+    *index_selectivity = 0.01;
+    *index_correlation = 0.0;
+    *index_pages = 1.0;
+}
+
+/// The @@@ operator implementation. Only used as an index condition seed:
+/// the planner matches `body @@@ 'query'` against strategy 1 of pgtantivy_ops
+/// and routes it to our bitmap scan. Runtime execution (when no index) is
+/// a naive substring/jieba fallback: NOT scored BM25 — use pgtantivy_search
+/// for ranking.
+#[pg_extern]
+fn pgtantivy_match(left: String, right: String) -> bool {
+    // Fallback (no index / recheck): naive containment on NFC forms.
+    let l = crate::nfc(&left);
+    let r = crate::nfc(&right);
+    l.contains(&r)
+}
 
 #[pg_extern(sql = "
 CREATE FUNCTION pgtantivy_am_handler(internal) RETURNS index_am_handler
@@ -24,9 +58,9 @@ AS 'MODULE_PATHNAME', '@FUNCTION_NAME@';
 CREATE ACCESS METHOD pgtantivy TYPE INDEX HANDLER pgtantivy_am_handler;
 
 CREATE OPERATOR FAMILY pgtantivy_ops USING pgtantivy;
+CREATE OPERATOR @@@ (LEFTARG = text, RIGHTARG = text, PROCEDURE = pgtantivy_match);
 CREATE OPERATOR CLASS pgtantivy_ops DEFAULT FOR TYPE text USING pgtantivy FAMILY pgtantivy_ops AS
-  OPERATOR 1 ~~ (text, text),
-  OPERATOR 2 ~~* (text, text);
+  OPERATOR 1 @@@ (text, text);
 ")]
 fn pgtantivy_am_handler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine> {
     let amroutine = unsafe {
@@ -50,6 +84,7 @@ fn pgtantivy_am_handler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::Inde
 
     (*amroutine).amvalidate = Some(validate as _);
     (*amroutine).amoptions = Some(amoptions as _);
+    (*amroutine).amcostestimate = Some(amcostestimate as _);
     (*amroutine).ambuild = Some(ambuild as _);
     (*amroutine).ambuildempty = Some(ambuildempty as _);
     (*amroutine).aminsert = Some(aminsert as _);
@@ -87,6 +122,14 @@ struct PgtantivyOpts {
 }
 
 static mut PGT_KIND: pg_sys::relopt_kind::Type = 0;
+
+/// relname -> tantivy ctid field handle (populated at ambuild).
+static CTID_FIELDS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, tantivy::schema::Field>>> =
+    std::sync::OnceLock::new();
+
+fn ctid_fields() -> &'static std::sync::Mutex<std::collections::HashMap<String, tantivy::schema::Field>> {
+    CTID_FIELDS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
 
 /// Register our reloption kind. MUST run inside _PG_init (allocations land
 /// in TopMemoryContext); registering mid-query leaves dangling relopt_gen
@@ -220,6 +263,7 @@ unsafe extern "C" fn ambuild(
     // Build the tantivy sidecar (same layout as pgtantivy_create).
     let mut sb = tantivy::schema::Schema::builder();
     let id_field = sb.add_i64_field("id", INDEXED | STORED | FAST);
+    let ctid_field = sb.add_u64_field("ctid", INDEXED | FAST | STORED);
     let indexing = TextFieldIndexing::default()
         .set_tokenizer(JIEBA_TOKENIZER)
         .set_index_option(IndexRecordOption::WithFreqsAndPositions);
@@ -265,11 +309,15 @@ unsafe extern "C" fn ambuild(
         }
         let text_datum = pg_sys::nocachegetattr(tup, text_attn, tupdesc);
         let id = id_datum.value() as i64;
+        let tid = (*tup).t_self;
+        let ctid_val = ((tid.ip_blkid.bi_hi as u64) << 48)
+            | ((tid.ip_blkid.bi_lo as u64) << 32)
+            | (tid.ip_posid as u64);
         let cstr = pg_sys::text_to_cstring(text_datum.cast_mut_ptr::<pg_sys::text>());
         let text = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
         let text_nfc = nfc(&text);
         writer
-            .add_document(tantivy::doc!(id_field => id, body_field => text_nfc.as_str()))
+            .add_document(tantivy::doc!(id_field => id, ctid_field => ctid_val, body_field => text_nfc.as_str()))
             .unwrap_or_else(|e| error!("pgtantivy: add_document failed: {e}"));
         state.n_docs += 1;
     }
@@ -283,6 +331,7 @@ unsafe extern "C" fn ambuild(
     let reader = tindex
         .reader()
         .unwrap_or_else(|e| error!("pgtantivy: reader failed: {e}"));
+    ctid_fields().lock().map(|mut m| m.insert(relname.clone(), ctid_field)).ok();
     if let Ok(mut reg) = registry().lock() {
         reg.insert(
             relname.clone(),
@@ -347,32 +396,141 @@ unsafe extern "C" fn amvacuumcleanup(
 ) -> *mut pg_sys::IndexBulkDeleteResult {
     std::ptr::null_mut()
 }
+// ── scan callbacks (bitmap path) ─────────────────────────────────────────
 
-// ── scan (minimal: not wired to planner in MVP) ─────────────────────────
+/// Scan-private state: materialized (ctid, score) cursor.
+struct AmScanState {
+    hits: Vec<(u64, f32)>,
+    pos: usize,
+}
+
+/// Extract the @@@ query string from the first scan key.
+unsafe fn query_from_scankeys(scan: pg_sys::IndexScanDesc) -> Option<String> {
+    let sd = &mut *scan;
+    if sd.numberOfKeys < 1 || sd.keyData.is_null() {
+        return None;
+    }
+    let key = &*sd.keyData;
+    if key.sk_argument.value() == 0 {
+        return None;
+    }
+    let cstr = pg_sys::text_to_cstring(key.sk_argument.cast_mut_ptr::<pg_sys::text>());
+    if cstr.is_null() {
+        return None;
+    }
+    let s = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+    pg_sys::pfree(cstr.cast());
+    Some(s)
+}
 
 unsafe extern "C" fn ambeginscan(
-    _index_rel: pg_sys::Relation,
-    _nkeys: i32,
-    _norderbys: i32,
+    index_rel: pg_sys::Relation,
+    nkeys: i32,
+    norderbys: i32,
 ) -> pg_sys::IndexScanDesc {
-    error!("pgtantivy: index scans are not yet supported; query via pgtantivy_search (planner integration is next)"
-    );
+    let r = pg_sys::RelationGetIndexScan(index_rel, nkeys, norderbys);
+    r
 }
 
 unsafe extern "C" fn amrescan(
-    _scan: pg_sys::IndexScanDesc,
-    _keys: *mut pg_sys::ScanKeyData,
+    scan: pg_sys::IndexScanDesc,
+    keys: pg_sys::ScanKey,
     _nkeys: i32,
-    _orderbys: *mut pg_sys::ScanKeyData,
+    _orderbys: pg_sys::ScanKey,
     _norderbys: i32,
 ) {
+    let sd = &mut *scan;
+    if !keys.is_null() {
+        sd.keyData = keys;
+    }
+    let hits = match query_from_scankeys(scan) {
+        Some(q) => {
+            let relname = std::ffi::CStr::from_ptr(
+                (*(*sd.indexRelation).rd_rel).relname.data.as_ptr(),
+            )
+            .to_string_lossy()
+            .into_owned();
+            let r = run_query(&relname, &q, 10_000);
+            r.unwrap_or_default()
+        }
+        None => vec![],
+    };
+    sd.opaque = Box::into_raw(Box::new(AmScanState { hits, pos: 0 })) as *mut _;
+    sd.xs_recheck = false;
 }
 
-unsafe extern "C" fn amendscan(_scan: pg_sys::IndexScanDesc) {}
+unsafe extern "C" fn amendscan(scan: pg_sys::IndexScanDesc) {
+    let sd = &mut *scan;
+    if !sd.opaque.is_null() {
+        drop(Box::from_raw(sd.opaque as *mut AmScanState));
+        sd.opaque = std::ptr::null_mut();
+    }
+}
 
-unsafe extern "C" fn amgetbitmap(
-    _scan: pg_sys::IndexScanDesc,
-    _tbm: *mut pg_sys::TIDBitmap,
-) -> i64 {
-    0
+unsafe extern "C" fn amgetbitmap(scan: pg_sys::IndexScanDesc, tbm: *mut pg_sys::TIDBitmap) -> i64 {
+    let sd = &mut *scan;
+    if sd.opaque.is_null() {
+        return 0;
+    }
+    let state = &mut *(sd.opaque as *mut AmScanState);
+    let n = state.hits.len();
+    if n == 0 {
+        return 0;
+    }
+    let mut tids: Vec<pg_sys::ItemPointerData> = Vec::with_capacity(n);
+    for (ctid, _score) in &state.hits {
+        tids.push(pg_sys::ItemPointerData {
+            ip_blkid: pg_sys::BlockIdData {
+                bi_hi: ((ctid >> 48) & 0xffff) as u16,
+                bi_lo: ((ctid >> 32) & 0xffff) as u16,
+            },
+            ip_posid: (ctid & 0xffff) as u16,
+        });
+    }
+    pg_sys::tbm_add_tuples(tbm, tids.as_mut_ptr(), n as i32, false);
+    n as i64
+}
+
+/// Run a sanitized BM25 query on the named sidecar, returning (ctid, score).
+unsafe fn run_query(relname: &str, query: &str, limit: usize) -> Option<Vec<(u64, f32)>> {
+    if registry().lock().ok()?.contains_key(relname) {
+        // already loaded in this backend
+    } else {
+        // cross-session: sidecar on disk, load it (and the ctid field handle)
+        let dir_path = std::path::Path::new(&index_root()).join(relname);
+        let dir = tantivy::directory::MmapDirectory::open(&dir_path).ok()?;
+        let index = tantivy::Index::open(dir).ok()?;
+        let lang = std::fs::read_to_string(dir_path.join("pgtantivy_meta.json"))
+            .ok()
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
+            .and_then(|v| v["lang"].as_str().map(std::string::ToString::to_string))
+            .unwrap_or_else(|| "chinese".to_string());
+        index.tokenizers().register(JIEBA_TOKENIZER, analyzer(&lang));
+        let schema = index.schema();
+        let body = schema.get_field("body").ok()?;
+        let id = schema.get_field("id").ok()?;
+        let ctid_f = schema.get_field("ctid").ok()?;
+        let reader = index.reader().ok()?;
+        registry().lock().ok()?.insert(
+            relname.to_string(),
+            std::sync::Arc::new(PgIndex { index: index.clone(), reader, body, id,
+                path: Some(dir_path.to_string_lossy().into_owned()) }),
+        );
+        ctid_fields().lock().ok()?.insert(relname.to_string(), ctid_f);
+    }
+    let idx = lookup(relname).ok()?;
+    let searcher = idx.reader.searcher();
+    let ctid_field = *ctid_fields().lock().ok()?.get(relname)?;
+    let mut parser = QueryParser::for_index(&idx.index, vec![idx.body]);
+    parser.set_conjunction_by_default();
+    let parsed = parser.parse_query(&sanitize(&nfc(query))).ok()?;
+    let top = searcher.search(&parsed, &TopDocs::with_limit(limit)).ok()?;
+    let mut out = Vec::with_capacity(top.len());
+    for (score, addr) in top {
+        let d: tantivy::TantivyDocument = searcher.doc(addr).ok()?;
+        if let Some(c) = d.get_first(ctid_field).and_then(|v| v.as_u64()) {
+            out.push((c, score));
+        }
+    }
+    Some(out)
 }

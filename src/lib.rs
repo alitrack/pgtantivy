@@ -670,7 +670,7 @@ fn pgtantivy_snippet(
     Ok(Some(snip.to_html()))
 }
 
-fn lookup(name: &str) -> Result<Arc<PgIndex>, Box<dyn std::error::Error>> {
+pub(crate) fn lookup(name: &str) -> Result<Arc<PgIndex>, Box<dyn std::error::Error>> {
     registry().lock()?.get(name).cloned().ok_or_else(|| {
         format!("pgtantivy: no index '{name}' (create with pgtantivy_create)").into()
     })
@@ -680,7 +680,7 @@ fn nfc(s: &str) -> String {
     s.nfc().collect::<String>()
 }
 
-fn sanitize(q: &str) -> String {
+pub(crate) fn sanitize(q: &str) -> String {
     q.chars()
         .map(|c| {
             if "+^-&|!(){}[]^\"~*?:\\/".contains(c) {
