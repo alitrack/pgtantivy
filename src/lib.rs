@@ -24,6 +24,7 @@ use unicode_normalization::UnicodeNormalization;
 pg_module_magic!();
 
 pub mod am;
+pub mod hybrid;
 
 // GUC pgtantivy.index_dir: where persistent indexes live. Empty (the
 // default) resolves to $PGDATA/pgtantivy.
