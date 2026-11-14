@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::{
-    IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, FAST, STORED,
+    IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, FAST, INDEXED, STORED,
 };
 use tantivy::snippet::SnippetGenerator;
 use tantivy::tokenizer::{
@@ -182,7 +182,9 @@ fn pgtantivy_create(
         return Err("pgtantivy: name must be [A-Za-z_][A-Za-z0-9_-]*, <=128 chars".into());
     }
     let mut sb = Schema::builder();
-    let id_field = sb.add_i64_field("id", STORED | FAST);
+    // id must be INDEXED so delete_term (upsert/remove) can find prior docs;
+    // FAST keeps the column store for fast id decoding in search results.
+    let id_field = sb.add_i64_field("id", INDEXED | STORED | FAST);
     let indexing = TextFieldIndexing::default()
         .set_tokenizer(JIEBA_TOKENIZER)
         .set_index_option(IndexRecordOption::WithFreqsAndPositions);
@@ -289,6 +291,71 @@ fn pgtantivy_load(
         "pgtantivy: index '{}' loaded ({} docs, lang={})",
         name, num_docs, lang
     ))
+}
+
+/// Incrementally append documents to an existing (loaded) index.
+#[pg_extern]
+fn pgtantivy_add(
+    name: String,
+    rows_json: String,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let idx = lookup(&name)?;
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&rows_json)?;
+    if rows.is_empty() {
+        return Ok(format!("pgtantivy: add to '{}' — nothing to do (0 rows)", name));
+    }
+    let body_field = idx.body;
+    let id_field = idx.id;
+    // writer-per-call: tantivy allows one live writer at a time; the one
+    // from create/add was dropped after commit, so this is safe.
+    let mut writer = idx
+        .index
+        .writer::<tantivy::TantivyDocument>(32 * 1024 * 1024)?;
+    let mut n = 0u64;
+    for row in rows {
+        let id = row["id"]
+            .as_i64()
+            .ok_or_else(|| format!("row missing id: {}", row))?;
+        let text = row["text"]
+            .as_str()
+            .ok_or_else(|| format!("row missing text: {}", row))?
+            .to_string();
+        let text_nfc = nfc(&text);
+        // upsert semantics: delete any prior doc with this id, then add
+        writer.delete_term(tantivy::Term::from_field_i64(id_field, id));
+        writer.add_document(doc!(id_field => id, body_field => text_nfc.as_str()))?;
+        n += 1;
+    }
+    writer.commit()?;
+    drop(writer);
+    idx.reader.reload()?;
+    Ok(format!("pgtantivy: {} doc(s) added to '{}' (upsert by id)", n, name))
+}
+
+/// Remove documents from an existing (loaded) index by id.
+#[pg_extern]
+fn pgtantivy_remove(
+    name: String,
+    ids: Array<i64>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let idx = lookup(&name)?;
+    let id_field = idx.id;
+    let ids: Vec<i64> = ids.iter().flatten().collect();
+    if ids.is_empty() {
+        return Ok(format!("pgtantivy: remove from '{}' — nothing to do (0 ids)", name));
+    }
+    let mut writer = idx
+        .index
+        .writer::<tantivy::TantivyDocument>(32 * 1024 * 1024)?;
+    let mut n = 0u64;
+    for id in &ids {
+        writer.delete_term(tantivy::Term::from_field_i64(id_field, *id));
+        n += 1;
+    }
+    writer.commit()?;
+    drop(writer);
+    idx.reader.reload()?;
+    Ok(format!("pgtantivy: {} id(s) removed from '{}'", n, name))
 }
 
 /// List indexes: on-disk (with loaded flag) — one row per index dir.
