@@ -1,0 +1,6 @@
+comment = 'pgtantivy:  Created by pgrx'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pgtantivy'
+relocatable = false
+superuser = true
+trusted = false

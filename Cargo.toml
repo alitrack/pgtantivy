@@ -1,0 +1,29 @@
+[package]
+name = "pgtantivy"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["pg17"]
+pg17 = ["pgrx/pg17"]
+pg_test = []
+
+[dependencies]
+pgrx = "=0.13.1"
+tantivy = { version = "=0.24.2", default-features = false, features = ["mmap", "stopwords", "lz4-compression"] }
+jieba-rs = "0.7"
+unicode-normalization = "0.1"
+serde_json = "1"
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+
+[[bin]]
+name = "pgrx_embed_pgtantivy"
+path = "src/bin/pgrx_embed.rs"
