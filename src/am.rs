@@ -23,7 +23,7 @@ use tantivy::schema::{IndexRecordOption, TextFieldIndexing, TextOptions, Value, 
 /// sidecar is sub-ms regardless of table size (mmap + inverted index).
 unsafe extern "C" fn amcostestimate(
     _root: *mut pg_sys::PlannerInfo,
-    _path: *mut pg_sys::IndexPath,
+    path: *mut pg_sys::IndexPath,
     _loop_count: f64,
     index_startup_cost: *mut pg_sys::Cost,
     index_total_cost: *mut pg_sys::Cost,
@@ -31,6 +31,22 @@ unsafe extern "C" fn amcostestimate(
     index_correlation: *mut f64,
     index_pages: *mut f64,
 ) {
+    // Pit #9: a constant cheap cost makes the planner pick this AM even for
+    // scans with NO index clauses (e.g. SELECT count(*) FROM t) — the scan
+    // then runs with no query key and returns nothing. An AM without usable
+    // clauses must price itself out.
+    let nclauses = if path.is_null() { 0 } else {
+        let l = (*path).indexclauses;
+        if l.is_null() { 0 } else { (*l).length }
+    };
+    if nclauses <= 0 {
+        *index_startup_cost = f64::MAX / 2.0;
+        *index_total_cost = f64::MAX / 2.0;
+        *index_selectivity = 1.0;
+        *index_correlation = 0.0;
+        *index_pages = 0.0;
+        return;
+    }
     *index_startup_cost = 0.01;
     *index_total_cost = 1.0;
     *index_selectivity = 0.01;
