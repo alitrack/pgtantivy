@@ -441,6 +441,49 @@ fn flush_pending() {
     }
 }
 
+/// Merge all searchable segments into one (manual compaction).
+/// After many incremental commits (add/remove/trigger syncs) the index
+/// accumulates small segments + tombstones. This rewrites it as a single
+/// segment: reclaimed disk, faster queries.
+#[pg_extern]
+fn pgtantivy_merge(
+    name: String,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let idx = lookup(&name)?;
+    let metas = idx.index.searchable_segment_metas()?;
+    let before = metas.len();
+    if before <= 1 {
+        return Ok(format!(
+            "pgtantivy: '{name}' already compact ({before} segment(s), nothing to merge)"
+        ));
+    }
+    let ids: Vec<_> = metas.iter().map(|m| m.id()).collect();
+    let mut writer = idx
+        .index
+        .writer::<tantivy::TantivyDocument>(64 * 1024 * 1024)?;
+    writer
+        .merge(&ids)
+        .wait()
+        .map_err(|e| format!("pgtantivy: merge failed: {e}"))?;
+    writer.commit()?;
+    // force full merge: repeatedly merge while >1 searchable segment remains
+    loop {
+        let metas = idx.index.searchable_segment_metas()?;
+        if metas.len() <= 1 {
+            break;
+        }
+        let ids: Vec<_> = metas.iter().map(|m| m.id()).collect();
+        writer
+            .merge(&ids)
+            .wait()
+            .map_err(|e| format!("pgtantivy: merge failed: {e}"))?;
+        writer.commit()?;
+    }
+    drop(writer);
+    idx.reader.reload()?;
+    Ok(format!("pgtantivy: '{name}' merged {before} segment(s) into 1"))
+}
+
 /// Drop all buffered ops (xact ABORT).
 fn discard_pending() {
     let mut g = match pending_ops().lock() {
