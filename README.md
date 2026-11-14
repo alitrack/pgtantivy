@@ -71,6 +71,14 @@ Requires: PostgreSQL 17, pgrx 0.13.1, tantivy 0.24, jieba-rs 0.7.
 
 ## Status
 
-v0.2.0 — prototype → usable: persistence, incremental writes, trigger sync, snippet highlighting, GUC config. Not yet: index AM (`CREATE INDEX USING pgtantivy`), segment merge management, parallel build.
+**v0.3.0** — the extension now drives a real PostgreSQL index access method:
+
+- `CREATE INDEX ... USING pgtantivy (body) WITH (text_column, id_column, language)` builds a tantivy sidecar in one statement
+- `WHERE body @@@ '查询'` plans as **Bitmap Index Scan** over the sidecar (BM25 matching, no heap recheck)
+- Manual + automatic segment merging (`pgtantivy.merge_threshold`, default 8, 0=off)
+- Trigger-based live sync, incremental writes, persistence, snippets, GUCs
+
+v0.2.0 — persistence, incremental writes, trigger sync, snippets, GUCs.
+v0.1.0 — initial prototype.
 
 E2E suites in `tests/`: `persist_e2e.sql`, `incremental_e2e.sql`, `trigger_sync_e2e.sql`, `bench_*.py` (100k-row corpus, recall harness).
