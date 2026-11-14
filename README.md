@@ -1,0 +1,76 @@
+# pgtantivy
+
+Chinese-first BM25 full-text search for PostgreSQL — [tantivy](https://github.com/quickwit-oss/tantivy) + [jieba-rs](https://github.com/messense/jieba-rs) via [pgrx](https://github.com/pgcentralfoundation/pgrx). MIT licensed, clean-room design (architecture notes from ParadeDB's BSD-3 pg_search, no code).
+
+## Why
+
+PostgreSQL native FTS (`to_tsvector('simple', ...)`) does not segment Chinese: a 60-char sentence becomes **one token**. On a 100k-row Chinese corpus, 50 real queries returned **0/50 hits** (bench in `tests/`). pgtantivy segments with jieba and ranks with BM25:
+
+| metric | pgtantivy | PG FTS ('simple' + GIN) |
+|:---|:---|:---|
+| index build (100k rows) | **1.09 s** | 3.16 s |
+| warm query latency | 3.1 ms | 0.5 ms* |
+| Chinese recall@10 | **9/9 = 1.00** | **0/50 hits** |
+
+\* PG is "fast" because whole-sentence tokens make every query a unique-key probe with zero usable results — a capability gap, not a performance race.
+
+## API surface
+
+```sql
+-- build a persistent index from JSON rows (id + text), chinese/english tokenizers
+SELECT pgtantivy_create('docs_idx',
+  (SELECT json_agg(json_build_object('id', doc_id, 'text', body))::text
+   FROM docs),
+  'chinese');
+-- → persisted to $PGDATA/pgtantivy/<name>/ (MmapDirectory, survives restarts)
+
+SELECT pgtantivy_load('docs_idx');   -- reload after restart / new session
+SELECT * FROM pgtantivy_list();      -- name, loaded, doc count
+SELECT pgtantivy_version();
+
+-- BM25 search (AND semantics across words), top-k
+SELECT id, score FROM pgtantivy_search('docs_idx', '量子 计算', 10);
+
+-- highlighted fragment with [HIGHLIGHT]...[/HIGHLIGHT] markers (Chinese-safe)
+SELECT pgtantivy_snippet('docs_idx', '量子比特', body) FROM docs WHERE doc_id = 1;
+
+-- incremental writes (upsert semantics: same id replaces)
+SELECT pgtantivy_add('docs_idx',
+  '[{"id": 90001, "text": "量子比特的相干时间是量子计算核心指标"}]');
+SELECT pgtantivy_remove('docs_idx', ARRAY[90002]);
+
+-- trigger auto-sync: index tracks the table, one tantivy commit per txn
+CREATE TRIGGER pgtantivy_sync
+  AFTER INSERT OR UPDATE OR DELETE ON docs
+  FOR EACH ROW EXECUTE PROCEDURE
+  pgtantivy_sync_trigger('docs_idx', 'doc_id', 'body');
+-- INSERT/UPDATE/DELETE visible after COMMIT; ROLLBACK discards cleanly;
+-- a 1000-row INSERT makes ONE segment, not a thousand.
+
+-- index directory (empty default = $PGDATA/pgtantivy)
+SET pgtantivy.index_dir = '/data/fti';
+```
+
+## Design notes
+
+- **Persistence**: MmapDirectory under `<index_dir>/<name>/`; language recorded in a `pgtantivy_meta.json` sidecar (not `meta.json` — that collides with tantivy's own segment metadata).
+- **Incremental correctness**: the `id` field is `INDEXED | STORED | FAST` — `delete_term` needs the term dictionary; FAST-only ids make upsert/remove silently no-op with ghost duplicates.
+- **Trigger batching**: row triggers buffer ops; a PRE_COMMIT xact callback flushes per-index (one tantivy commit per index per transaction). An ABORT callback drains the buffer — without it, rolled-back ops leak into the next transaction's flush.
+- **Process-level registry**: loaded indexes live in a process-wide map; after a restart or in a new backend, `pgtantivy_load()` re-mmaps from disk. The disk is the source of truth.
+- **Ranking**: conjunction (AND) BM25. Verified 1.00 recall@10 on unique-term ground truth; common-word TF ranking behaves per spec (see `tests/bench_recall.py` for the ground-truth methodology).
+
+## Build & install
+
+```bash
+cargo build --release --features pg17 --no-default-features
+# then place the .so + SQL where your PG can see them, or:
+cargo pgrx install --pg17   # if pgrx-managed PG
+```
+
+Requires: PostgreSQL 17, pgrx 0.13.1, tantivy 0.24, jieba-rs 0.7.
+
+## Status
+
+v0.2.0 — prototype → usable: persistence, incremental writes, trigger sync, snippet highlighting, GUC config. Not yet: index AM (`CREATE INDEX USING pgtantivy`), segment merge management, parallel build.
+
+E2E suites in `tests/`: `persist_e2e.sql`, `incremental_e2e.sql`, `trigger_sync_e2e.sql`, `bench_*.py` (100k-row corpus, recall harness).
