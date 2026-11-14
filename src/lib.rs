@@ -27,6 +27,11 @@ pg_module_magic!();
 // default) resolves to $PGDATA/pgtantivy.
 static INDEX_DIR_GUC: GucSetting<Option<&'static CStr>> = GucSetting::<Option<&'static CStr>>::new(None);
 
+// GUC pgtantivy.merge_threshold: auto-compact after an incremental write
+// leaves this many searchable segments (0 = never; manual-only via
+// pgtantivy_merge). Default 8.
+static MERGE_THRESHOLD_GUC: GucSetting<i32> = GucSetting::<i32>::new(8);
+
 #[allow(non_snake_case)]
 #[no_mangle]
 #[pg_guard]
@@ -39,6 +44,61 @@ pub unsafe extern "C" fn _PG_init() {
         GucContext::Userset,
         GucFlags::default(),
     );
+    GucRegistry::define_int_guc(
+        "pgtantivy.merge_threshold",
+        "Auto-merge segment threshold for incremental writes",
+        "After an incremental write, if the index has this many searchable segments or more it is auto-compacted. 0 disables (manual pgtantivy_merge only).",
+        &MERGE_THRESHOLD_GUC,
+        0,
+        1024,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+}
+
+/// Auto-compact helper: called after incremental writes (add / trigger
+/// flush). If the GUC threshold is >=1 and the index has at least that
+/// many searchable segments, run the same full-merge loop as
+/// pgtantivy_merge (best effort — errors are warnings, never hard fail
+/// the DML that triggered them).
+fn maybe_auto_merge(idx: &PgIndex, name: &str) {
+    let threshold = MERGE_THRESHOLD_GUC.get();
+    if threshold < 1 {
+        return;
+    }
+    let segs = match idx.index.searchable_segment_metas() {
+        Ok(m) => m.len(),
+        Err(_) => return,
+    };
+    if (segs as i32) < threshold {
+        return;
+    }
+    info!("pgtantivy: auto-merge '{name}' ({segs} segments >= threshold {threshold})");
+    if let Err(e) = merge_all(idx) {
+        warning!("pgtantivy auto-merge '{name}' failed: {e}");
+    }
+}
+
+/// Full merge loop shared by pgtantivy_merge and auto-merge.
+fn merge_all(idx: &PgIndex) -> Result<(), Box<dyn std::error::Error>> {
+    let mut writer = idx
+        .index
+        .writer::<tantivy::TantivyDocument>(64 * 1024 * 1024)?;
+    loop {
+        let metas = idx.index.searchable_segment_metas()?;
+        if metas.len() <= 1 {
+            break;
+        }
+        let ids: Vec<_> = metas.iter().map(|m| m.id()).collect();
+        writer
+            .merge(&ids)
+            .wait()
+            .map_err(|e| format!("merge failed: {e}"))?;
+        writer.commit()?;
+    }
+    drop(writer);
+    idx.reader.reload()?;
+    Ok(())
 }
 
 
@@ -331,6 +391,7 @@ fn pgtantivy_add(
     writer.commit()?;
     drop(writer);
     idx.reader.reload()?;
+    maybe_auto_merge(&idx, &name);
     Ok(format!("pgtantivy: {} doc(s) added to '{}' (upsert by id)", n, name))
 }
 
@@ -438,6 +499,7 @@ fn flush_pending() {
         }
         drop(writer);
         let _ = idx.reader.reload();
+        maybe_auto_merge(&idx, &name);
     }
 }
 
@@ -450,37 +512,13 @@ fn pgtantivy_merge(
     name: String,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let idx = lookup(&name)?;
-    let metas = idx.index.searchable_segment_metas()?;
-    let before = metas.len();
+    let before = idx.index.searchable_segment_metas()?.len();
     if before <= 1 {
         return Ok(format!(
             "pgtantivy: '{name}' already compact ({before} segment(s), nothing to merge)"
         ));
     }
-    let ids: Vec<_> = metas.iter().map(|m| m.id()).collect();
-    let mut writer = idx
-        .index
-        .writer::<tantivy::TantivyDocument>(64 * 1024 * 1024)?;
-    writer
-        .merge(&ids)
-        .wait()
-        .map_err(|e| format!("pgtantivy: merge failed: {e}"))?;
-    writer.commit()?;
-    // force full merge: repeatedly merge while >1 searchable segment remains
-    loop {
-        let metas = idx.index.searchable_segment_metas()?;
-        if metas.len() <= 1 {
-            break;
-        }
-        let ids: Vec<_> = metas.iter().map(|m| m.id()).collect();
-        writer
-            .merge(&ids)
-            .wait()
-            .map_err(|e| format!("pgtantivy: merge failed: {e}"))?;
-        writer.commit()?;
-    }
-    drop(writer);
-    idx.reader.reload()?;
+    merge_all(&idx)?;
     Ok(format!("pgtantivy: '{name}' merged {before} segment(s) into 1"))
 }
 
