@@ -15,8 +15,29 @@ use tantivy::tokenizer::{
     LowerCaser, SimpleTokenizer, TextAnalyzer, Token, TokenStream, Tokenizer,
 };
 use tantivy::{doc, Index, IndexReader};
+use std::ffi::CStr;
+
+use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use unicode_normalization::UnicodeNormalization;
 pg_module_magic!();
+
+// GUC pgtantivy.index_dir: where persistent indexes live. Empty (the
+// default) resolves to $PGDATA/pgtantivy.
+static INDEX_DIR_GUC: GucSetting<Option<&'static CStr>> = GucSetting::<Option<&'static CStr>>::new(None);
+
+#[allow(non_snake_case)]
+#[no_mangle]
+#[pg_guard]
+pub unsafe extern "C" fn _PG_init() {
+    GucRegistry::define_string_guc(
+        "pgtantivy.index_dir",
+        "Base directory for persistent pgtantivy indexes",
+        "Where pgtantivy stores persistent indexes. Empty = $PGDATA/pgtantivy.",
+        &INDEX_DIR_GUC,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+}
 
 
 
@@ -113,6 +134,22 @@ struct PgIndex {
     reader: IndexReader,
     body: tantivy::schema::Field,
     id: tantivy::schema::Field,
+    /// On-disk directory when persistent (None for legacy in-memory only).
+    path: Option<String>,
+}
+
+fn index_root() -> String {
+    let cur = INDEX_DIR_GUC
+        .get()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if cur.trim().is_empty() {
+        format!("{}/pgtantivy", unsafe {
+            CStr::from_ptr(pgrx::pg_sys::DataDir).to_string_lossy()
+        })
+    } else {
+        cur
+    }
 }
 
 fn registry() -> &'static Mutex<HashMap<String, Arc<PgIndex>>> {
@@ -154,7 +191,16 @@ fn pgtantivy_create(
         TextOptions::default().set_indexing_options(indexing),
     );
     let schema = sb.build();
-    let index = Index::create_in_ram(schema);
+    // Persistent layout: <index_dir>/<name>/ (MmapDirectory, survives
+    // restarts). Wiped on rebuild, same contract as create.
+    let root = index_root();
+    let dir_path = std::path::Path::new(&root).join(&name);
+    if dir_path.exists() {
+        std::fs::remove_dir_all(&dir_path)?;
+    }
+    std::fs::create_dir_all(&dir_path)?;
+    let dir = tantivy::directory::MmapDirectory::open(&dir_path)?;
+    let index = Index::open_or_create(dir, schema)?;
     let a = analyzer(&lang);
     index.tokenizers().register(JIEBA_TOKENIZER, a);
 
@@ -171,6 +217,11 @@ fn pgtantivy_create(
         writer.add_document(doc!(id_field => id, body_field => text_nfc.as_str()))?;
     }
     writer.commit()?;
+    // Sidecar: language for load-time tokenizer registration.
+    let _ = std::fs::write(
+        dir_path.join("pgtantivy_meta.json"),
+        serde_json::json!({"lang": lang}).to_string(),
+    );
     let reader = index.reader()?;
     registry().lock()?.insert(
         name.clone(),
@@ -179,9 +230,89 @@ fn pgtantivy_create(
             reader,
             body: body_field,
             id: id_field,
+            path: Some(dir_path.to_string_lossy().into_owned()),
         }),
     );
-    Ok(format!("pgtantivy: index '{}' created", name))
+    Ok(format!(
+        "pgtantivy: index '{}' created at {}",
+        name,
+        dir_path.display()
+    ))
+}
+
+/// Open a persistent index from disk into the registry (after a restart).
+#[pg_extern]
+fn pgtantivy_load(
+    name: String,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if !safe_name(&name) {
+        return Err("pgtantivy: name must be [A-Za-z_][A-Za-z0-9_-]*, <=128 chars".into());
+    }
+    if registry().lock()?.contains_key(&name) {
+        return Ok(format!("pgtantivy: index '{}' already loaded", name));
+    }
+    let dir_path = std::path::Path::new(&index_root()).join(&name);
+    let dir = tantivy::directory::MmapDirectory::open(&dir_path)
+        .map_err(|e| format!("pgtantivy: no index '{}' on disk ({e})", name))?;
+    let index = Index::open(dir)?;
+    let meta = index.tokenizers();
+    let _ = meta;
+    // Tokenizer: jieba for any index we created (language recorded in meta.json).
+    let lang = std::fs::read_to_string(dir_path.join("pgtantivy_meta.json"))
+        .ok()
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
+        .and_then(|v| v["lang"].as_str().map(std::string::ToString::to_string))
+        .unwrap_or_else(|| "chinese".to_string());
+    index
+        .tokenizers()
+        .register(JIEBA_TOKENIZER, analyzer(&lang));
+    let schema = index.schema();
+    let body = schema
+        .get_field("body")
+        .map_err(|_| "pgtantivy: index lacks body field")?;
+    let id = schema
+        .get_field("id")
+        .map_err(|_| "pgtantivy: index lacks id field")?;
+    let reader = index.reader()?;
+    let num_docs = reader.searcher().num_docs();
+    registry().lock()?.insert(
+        name.clone(),
+        Arc::new(PgIndex {
+            index,
+            reader,
+            body,
+            id,
+            path: Some(dir_path.to_string_lossy().into_owned()),
+        }),
+    );
+    Ok(format!(
+        "pgtantivy: index '{}' loaded ({} docs, lang={})",
+        name, num_docs, lang
+    ))
+}
+
+/// List indexes: on-disk (with loaded flag) — one row per index dir.
+#[pg_extern]
+fn pgtantivy_list(
+) -> TableIterator<'static, (name!(name, String), name!(loaded, bool), name!(docs, i64))> {
+    let root = index_root();
+    let mut rows: Vec<(String, bool, i64)> = Vec::new();
+    let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(rd) = std::fs::read_dir(&root) {
+        for e in rd.flatten() {
+            let fname = e.file_name().to_string_lossy().into_owned();
+            if !safe_name(&fname) {
+                continue;
+            }
+            let loaded = reg.contains_key(&fname);
+            let docs = reg
+                .get(&fname)
+                .map(|i| i.reader.searcher().num_docs() as i64)
+                .unwrap_or(-1);
+            rows.push((fname, loaded, docs));
+        }
+    }
+    TableIterator::new(rows)
 }
 
 /// BM25 search over a named index. AND semantics, sanitized.
@@ -274,5 +405,3 @@ pub mod test {
     }
 }
 
-#[pg_guard]
-extern "C" fn _PG_init() {}
