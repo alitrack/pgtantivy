@@ -701,7 +701,7 @@ mod pg_test_tests {
     #[pg_test]
     fn test_smoke() {
         let r = pgtantivy_version();
-        assert!(r.starts_with("0.3"));
+        assert!(r.starts_with("0.4"));
     }
 }
 

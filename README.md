@@ -71,6 +71,17 @@ Requires: PostgreSQL 17, pgrx 0.13.1, tantivy 0.24, jieba-rs 0.7.
 
 ## Status
 
+**v0.4.0** — hybrid search, server-side:
+
+```sql
+-- BM25 (tantivy) + pgvector ANN, fused with Reciprocal Rank Fusion
+SELECT id, rrf_score, fts_rank, vec_rank
+FROM pgtantivy_hybrid('docs_fts', '量子比特', 'docs_vec', 'embedding', 'id',
+                      '[0.95, 0.05, 0.0]', 'cosine', 50, 10, 60);
+```
+
+One MIT extension + pgvector = Elasticsearch-style hybrid search without leaving PostgreSQL. Vector side is delegated to pgvector (no second index AM, no extra WAL surface); RRF recipe validated at recall 1.000 / MRR 1.000 on a 90k-doc benchmark.
+
 **v0.3.0** — the extension now drives a real PostgreSQL index access method:
 
 - `CREATE INDEX ... USING pgtantivy (body) WITH (text_column, id_column, language)` builds a tantivy sidecar in one statement
