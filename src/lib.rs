@@ -593,6 +593,11 @@ fn pgtantivy_touch(name: String) -> Result<String, Box<dyn std::error::Error>> {
 /// bundle and the writer's live index is untouched (copy-on-export).
 ///
 /// `writer_id` is the single-writer fence tag (default: `<hostname>.<pid>`).
+/// Once an export has fenced this index to a writer identity, an export under a
+/// different identity is refused (dual-writer protection); rebuild to change it.
+/// `keep` retains the N newest `<name>-<opstamp>.bundle` dirs in `dest` and
+/// deletes older ones (0/NULL = retain all).
+///
 /// Bundles are the transfer unit to a reader instance (copy to the other node,
 /// then `pgtantivy_import_index`); S3 is 方案 2 (same format, drop-in).
 #[pg_extern]
@@ -600,6 +605,7 @@ fn pgtantivy_export_index(
     name: String,
     dest: String,
     writer_id: Option<String>,
+    keep: Option<i64>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     if !safe_name(&name) {
         return Err("pgtantivy: name must be [A-Za-z_][A-Za-z0-9_-]*, <=128 chars".into());
@@ -608,8 +614,13 @@ fn pgtantivy_export_index(
     if !dir_path.exists() {
         return Err(format!("pgtantivy: no index '{name}' on disk").into());
     }
-    let (bundle, opstamp, n_files) =
-        snapshot::export_bundle(&name, &dir_path, &dest, writer_id)?;
+    let (bundle, opstamp, n_files) = snapshot::export_bundle(
+        &name,
+        &dir_path,
+        &dest,
+        writer_id,
+        keep.unwrap_or(0).max(0) as u64,
+    )?;
     Ok(format!(
         "pgtantivy: exported '{name}' opstamp {opstamp} ({n_files} files) to {}",
         bundle.display()

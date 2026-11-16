@@ -141,6 +141,86 @@ fn default_writer_id() -> String {
 /// Monotonically bump + persist the export opstamp in the index sidecar meta;
 /// returns the new opstamp. First export of a freshly created index (no key)
 /// starts at 1.
+/// Single-writer fence on the source index. When an export declares an
+/// explicit writer identity `writer`, the index sidecar records
+/// `fence_writer`. A later export from the same index directory must reuse the
+/// same identity — a different one is refused (dual-writer protection). The
+/// fence resets on a rebuild because `pgtantivy_create` wipes the index dir.
+fn apply_write_fence(dir: &Path, writer: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let meta_path = dir.join("pgtantivy_meta.json");
+    let mut v = std::fs::read_to_string(&meta_path)
+        .ok()
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
+        .unwrap_or(serde_json::json!({}));
+    let o = v.as_object_mut().ok_or_else(|| -> Box<dyn std::error::Error> {
+        "pgtantivy: index meta is not a JSON object".into()
+    })?;
+    match o.get("fence_writer").and_then(|x| x.as_str()) {
+        Some(prev) if prev != writer => {
+            return Err(format!(
+                "pgtantivy: dual-writer protection — index already fenced to \
+                 writer '{prev}', refusing export as '{writer}'. Rebuild the index \
+                 (pgtantivy_create) to change writer."
+            )
+            .into());
+        }
+        Some(_) => {} // same writer: fence already set, no-op
+        None => {
+            o.insert("fence_writer".to_string(), serde_json::json!(writer));
+            let tmp = dir.join(format!(
+                ".pgtantivy_meta.{}.fence.tmp",
+                std::process::id()
+            ));
+            std::fs::write(&tmp, v.to_string())?;
+            std::fs::rename(&tmp, &meta_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Retain the `keep` newest bundles for `name` in `dest`, deleting older
+/// `<name>-<opstamp>.bundle` directories. `keep == 0` retains all. Returns the
+/// number of bundles deleted. Only directories matching the exact bundle
+/// naming convention are touched — nothing else is ever removed.
+pub(crate) fn gc_bundles(dest: &str, name: &str, keep: u64) -> Result<u64, Box<dyn std::error::Error>> {
+    if keep == 0 {
+        return Ok(0);
+    }
+    let dest = std::path::Path::new(dest.trim());
+    let mut found: Vec<(u64, std::path::PathBuf)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dest) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            // <name>-<opstamp>.bundle
+            let Some(stem) = fname.strip_suffix(".bundle") else {
+                continue;
+            };
+            let Some(op_str) = stem.strip_prefix(&format!("{name}-")) else {
+                continue;
+            };
+            let Ok(op) = op_str.parse::<u64>() else {
+                continue;
+            };
+            found.push((op, p));
+        }
+    }
+    if found.len() <= keep as usize {
+        return Ok(0);
+    }
+    found.sort_by_key(|(op, _)| std::cmp::Reverse(*op));
+    let mut deleted = 0u64;
+    for (op, p) in found.iter().skip(keep as usize) {
+        std::fs::remove_dir_all(p)?;
+        deleted += 1;
+        let _ = op;
+    }
+    Ok(deleted)
+}
+
 fn next_opstamp(dir: &Path) -> std::io::Result<u64> {
     let meta_path = dir.join("pgtantivy_meta.json");
     let mut v = std::fs::read_to_string(&meta_path)
@@ -175,6 +255,7 @@ pub(crate) fn export_bundle(
     dir: &Path,
     dest: &str,
     writer_id: Option<String>,
+    keep: u64,
 ) -> Result<(std::path::PathBuf, u64, usize), Box<dyn std::error::Error>> {
     if !dir.is_dir() {
         return Err(format!("pgtantivy: no on-disk index directory {dir:?}").into());
@@ -194,10 +275,14 @@ pub(crate) fn export_bundle(
     }
     std::fs::create_dir_all(dest)?;
 
-    let opstamp = next_opstamp(dir)?;
     let writer_id = writer_id
         .filter(|w| !w.trim().is_empty())
         .unwrap_or_else(default_writer_id);
+    // Dual-writer protection: once an export has fenced this index to a writer
+    // identity, any export under a different identity is refused. Checked
+    // BEFORE bumping the opstamp, so a rejected export does not consume a version.
+    apply_write_fence(dir, &writer_id)?;
+    let opstamp = next_opstamp(dir)?;
 
     // Doc count + lang + anchor from the source. A transient reader is opened and
     // dropped; the running registry index is untouched.
@@ -262,6 +347,8 @@ pub(crate) fn export_bundle(
         let _ = std::fs::remove_dir_all(&tmp_dir);
         return Err(e.into());
     }
+    // Retention: keep the `keep` newest bundles for this name; drop older ones.
+    let _ = gc_bundles(dest, name, keep);
     Ok((final_dir, opstamp, manifest.files.len()))
 }
 

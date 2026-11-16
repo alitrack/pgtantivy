@@ -98,7 +98,7 @@ def main() -> int:
 
     # ---- A. build + export --------------------------------------------
     q(f"SELECT pgtantivy_create('snap', {sqlq(CORPUS)}, 'chinese');")
-    exp1 = q(f"SELECT pgtantivy_export_index('snap', '{B1}', 'writer-A');")
+    exp1 = q(f"SELECT pgtantivy_export_index('snap', '{B1}', 'writer-A', 0);")
     print("A. export    :", exp1)
     assert "exported" in exp1 and "files)" in exp1, "export return shape"
     assert "opstamp 1" in exp1, f"first export should be opstamp 1: {exp1!r}"
@@ -137,10 +137,37 @@ def main() -> int:
     # into its in-process registry before add.
     add_rows = json.dumps([{"id": 9001, "text": "alpha gamma 9001"}])
     q(f"SELECT pgtantivy_load('snap'); SELECT pgtantivy_add('snap', {sqlq(add_rows)});")
-    exp2 = q(f"SELECT pgtantivy_export_index('snap', '{B2}', 'writer-A');")
+    exp2 = q(f"SELECT pgtantivy_export_index('snap', '{B2}', 'writer-A', 0);")
     op2 = opstamp_of(exp2)
     print(f"E. opstamp   : {op1} -> {op2}  (after 1 add)")
     assert op2 > op1, f"opstamp must bump on write: {op1} !> {op2}"
+
+    # ---- G. dual-writer fence: export as a DIFFERENT writer is refused ---
+    # 'snap' is now fenced to writer-A; an export claiming writer-B must fail
+    # loudly instead of silently double-writing the shared index.
+    g_err = q_err(f"SELECT pgtantivy_export_index('snap', '{B2}', 'writer-B', 0);")
+    print("G. fence    :", (g_err.splitlines() or ["(empty)"])[0])
+    assert g_err and "dual-writer" in g_err, \
+        f"different-writer export must be refused, got: {g_err!r}"
+    # ...and the same writer still succeeds (no false positive):
+    q(f"SELECT pgtantivy_export_index('snap', '{B2}', 'writer-A', 0);")
+
+    # ---- H. GC retention: keep=2 drops older bundles, keeps newest 2 ------
+    # after the G-section re-export, dest B2 has bundles 1,2,3 -> keep 2 keeps
+    # 2 and 3, deletes 1.
+    before = sorted(os.listdir(B2))
+    q(f"SELECT pgtantivy_load('snap'); SELECT pgtantivy_add('snap', {sqlq(add_rows)});"
+      f" SELECT pgtantivy_export_index('snap', '{B2}', 'writer-A', 2);")
+    after = sorted(os.listdir(B2))
+    kept = [d for d in after if d.endswith(".bundle")]
+    print(f"H. retention : before={len(before)} dirs, after={len(after)} dirs; kept={kept}")
+    assert len(kept) == 2, f"keep=2 must retain exactly 2 bundles, got {len(kept)}: {kept}"
+    # the two retained must be the HIGHEST opstamps (newest), not the oldest.
+    # op2 (E) -> G re-export is op2+1 -> H is op2+2; keep 2 of {op2, op2+1,
+    # op2+2} retains the two newest = op2+1, op2+2.
+    ops_kept = sorted(int(d.split("-")[1].split(".")[0]) for d in kept)
+    assert ops_kept == [op2 + 1, op2 + 2], \
+        f"retained must be the 2 newest, got opstamps {ops_kept} (expected {op2 + 1},{op2 + 2})"
 
     # ---- F. integrity: corrupt a bundled file -> import must fail -----
     cand = [os.path.join(root, f) for root, _, fs in os.walk(BUNDLE)
@@ -160,8 +187,9 @@ def main() -> int:
     for d in (B1, B2, IDX):
         shutil.rmtree(d, ignore_errors=True)
 
-    print("\nSNAPSHOT E2E: all 6 checks passed "
-          "(export / info / import / fresh-backend-search / opstamp-bump / fnv-verify)")
+    print("\nSNAPSHOT E2E: all 8 checks passed "
+          "(export / info / import / fresh-backend-search / opstamp-bump / "
+          "dual-writer-fence / gc-retention / fnv-verify)")
     return 0
 
 
