@@ -386,14 +386,23 @@ struct S3Directory {
     s3: Arc<AmazonS3>,
     prefix: String,
     cache: Arc<Mutex<HashMap<String, Bytes>>>,
+    /// Per-file length cache seeded from the bundle `manifest.json` (each
+    /// `FileEntry.size`). Lets `get_file_handle`/`exists` avoid a per-file
+    /// `head` round-trip on the cold path.
+    lens: HashMap<String, u64>,
 }
 
 impl S3Directory {
-    fn new(s3: Arc<AmazonS3>, prefix: &str) -> Self {
+    fn new(
+        s3: Arc<AmazonS3>,
+        prefix: &str,
+        lens: HashMap<String, u64>,
+    ) -> Self {
         Self {
             s3,
             prefix: prefix.trim_end_matches('/').to_string(),
             cache: Arc::new(Mutex::new(HashMap::new())),
+            lens,
         }
     }
 }
@@ -405,21 +414,28 @@ impl Directory for S3Directory {
             return Err(OpenReadError::FileDoesNotExist(PathBuf::from("empty")));
         }
         let key = format!("{}/{}", self.prefix, rel);
-        let s3 = self.s3.clone();
-        let k = key.clone();
-        let meta = rt()
-            .block_on(async move { s3.head(&OPath::from(k.as_str())).await })
-            .map_err(|e| OpenReadError::IoError {
-                io_error: Arc::new(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("no object {key}: {e}"),
-                )),
-                filepath: Path::new(&key).to_path_buf(),
-            })?;
+        // Length from the manifest cache; fall back to a single `head` only for
+        // a file the manifest does not list.
+        let len = if let Some(&l) = self.lens.get(&rel) {
+            l
+        } else {
+            let s3 = self.s3.clone();
+            let k = key.clone();
+            rt()
+                .block_on(async move { s3.head(&OPath::from(k.as_str())).await })
+                .map_err(|e| OpenReadError::IoError {
+                    io_error: Arc::new(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("no object {key}: {e}"),
+                    )),
+                    filepath: Path::new(&key).to_path_buf(),
+                })?
+                .size
+        };
         Ok(Arc::new(S3FileHandle {
             s3: self.s3.clone(),
             key,
-            len: meta.size,
+            len,
             cache: self.cache.clone(),
         }))
     }
@@ -432,6 +448,10 @@ impl Directory for S3Directory {
     fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
         let rel = path.to_str().unwrap_or("").trim_start_matches('/').to_string();
         if rel.is_empty() {
+            return Ok(true);
+        }
+        // Manifest-backed: a listed file exists without any S3 round-trip.
+        if self.lens.contains_key(&rel) {
             return Ok(true);
         }
         let key = format!("{}/{}", self.prefix, rel);
@@ -473,9 +493,10 @@ impl Directory for S3Directory {
 }
 
 /// Open an S3 bundle with the range-read `S3Directory` (approach 2) — no full
-/// download. Returns the opened `Index` and the index's recorded `lang` (from
-/// the bundle's `pgtantivy_meta.json`) so the caller can register the matching
-/// tokenizer.
+/// download. Reads the bundle `manifest.json` ONCE (the published marker) to
+/// seed the per-file length cache (kills the cold-path per-file `head`
+/// round-trips) and to recover `lang` for tokenizer registration. Returns the
+/// opened `Index` and the index's recorded `lang`.
 pub fn open_s3_index(
     endpoint: &str,
     bucket: &str,
@@ -485,26 +506,38 @@ pub fn open_s3_index(
     bundle_key_prefix: &str,
 ) -> Result<(Index, String), Box<dyn std::error::Error>> {
     let store = Arc::new(build_store(endpoint, bucket, region, access_key, secret)?);
-    // Read the lang sidecar (small object) so search registers the right tokenizer.
-    let lang = {
-        let meta_key = format!("{}/pgtantivy_meta.json", bundle_key_prefix.trim_end_matches('/'));
+    // One object read: the manifest is both the published marker and the
+    // length/lang seed for the range-read directory.
+    let manifest_key = format!("{}/manifest.json", bundle_key_prefix.trim_end_matches('/'));
+    let manifest: Option<crate::snapshot::Manifest> = {
         let s3 = store.clone();
-        let k = meta_key.clone();
-        let r = rt().block_on(async move {
+        let k = manifest_key.clone();
+        rt().block_on(async move {
             let p = OPath::from(k.as_str());
             let g = s3.get(&p).await?;
-            g.bytes().await
-        });
-        r.ok()
-            .and_then(|b| {
-                let s = String::from_utf8_lossy(&b).to_string();
-                serde_json::from_str::<serde_json::Value>(&s)
-                    .ok()
-                    .and_then(|v| v["lang"].as_str().map(std::string::ToString::to_string))
-            })
-            .unwrap_or_else(|| "chinese".to_string())
+            let b = g.bytes().await?;
+            let m: crate::snapshot::Manifest = serde_json::from_slice(&b)
+                .map_err(|e| object_store::Error::Generic {
+                    store: "s3",
+                    source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
+                })?;
+            Ok::<crate::snapshot::Manifest, object_store::Error>(m)
+        })
+        .ok()
     };
-    let dir = S3Directory::new(store, bundle_key_prefix);
+    let (lang, lens) = match manifest {
+        Some(m) => {
+            let lens = m.files.iter().map(|f| (f.rel.clone(), f.size)).collect();
+            (m.lang, lens)
+        }
+        None => {
+            // No manifest: not a published pgtantivy bundle — degrade to
+            // per-file heads and the default tokenizer language.
+            eprintln!("pgtantivy: no manifest.json for {manifest_key}; opening without length cache");
+            ("chinese".to_string(), HashMap::new())
+        }
+    };
+    let dir = S3Directory::new(store, bundle_key_prefix, lens);
     let index = Index::open(Box::new(dir) as Box<dyn Directory>)?;
     Ok((index, lang))
 }

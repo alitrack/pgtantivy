@@ -776,6 +776,7 @@ fn pgtantivy_load_s3(
     prefix: String,
     bundle_name: String,
     as_name: String,
+    warm_terms: Option<String>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     if !safe_name(&as_name) {
         return Err("pgtantivy: name must be [A-Za-z_][A-Za-z0-9_-]*, <=128 chars".into());
@@ -818,9 +819,36 @@ fn pgtantivy_load_s3(
             path: Some(format!("s3://{bucket}/{bundle_key_prefix}")),
         }),
     );
+    // Query warm-up: run a throwaway search per term so the hot splits (term
+    // dict + postings + .store footers) are pulled into the per-process cache
+    // NOW, instead of on the first real query (which would pay N cold RTTs).
+    // Errors warming one term are non-fatal — the index is still usable.
+    let warmed: Vec<String> = warm_terms
+        .map(|w| {
+            w.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut warmed_ok = Vec::new();
+    for term in &warmed {
+        let idx = registry().lock()?.get(&as_name).cloned();
+        if let Some(idx) = idx {
+            let searcher = idx.reader.searcher();
+            let mut parser = QueryParser::for_index(&idx.index, vec![idx.body]);
+            parser.set_conjunction_by_default();
+            if let Ok(parsed) = parser.parse_query(&sanitize(&nfc(term))) {
+                let _ = searcher.search(&parsed, &TopDocs::with_limit(1));
+                warmed_ok.push(term.clone());
+            }
+        }
+    }
+    let warmed_note = if warmed_ok.is_empty() {
+        String::new()
+    } else {
+        format!(" (warmed: {})", warmed_ok.join(", "))
+    };
     Ok(format!(
-        "pgtantivy: loaded '{as_name}' from s3://{bucket}/{bundle_key_prefix} (range-read, {} docs, lang={})",
-        num_docs, lang
+        "pgtantivy: loaded '{as_name}' from s3://{bucket}/{bundle_key_prefix} (range-read, {} docs, lang={lang}{warmed_note})",
+        num_docs
     ))
 }
 

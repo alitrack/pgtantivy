@@ -35,8 +35,9 @@ PREFIX = "fti"
 LOAD_S3_FN = """
 CREATE OR REPLACE FUNCTION "pgtantivy_load_s3"(
   "endpoint" TEXT, "bucket" TEXT, "region" TEXT, "access_key" TEXT,
-  "secret" TEXT, "prefix" TEXT, "bundle_name" TEXT, "as_name" TEXT
-) RETURNS TEXT LANGUAGE c STRICT AS '/tmp/pgext/lib/pgtantivy.so', 'pgtantivy_load_s3_wrapper';
+  "secret" TEXT, "prefix" TEXT, "bundle_name" TEXT, "as_name" TEXT,
+  "warm_terms" TEXT
+) RETURNS TEXT LANGUAGE c AS '/tmp/pgext/lib/pgtantivy.so', 'pgtantivy_load_s3_wrapper';
 """
 S3_FNS = """
 CREATE OR REPLACE FUNCTION "pgtantivy_export_to_s3"(
@@ -52,14 +53,18 @@ def sqlq(s: str) -> str:
 
 
 def q(sql: str) -> str:
+    lines = q_lines(sql)
+    return lines[-1].strip() if lines else ""
+
+
+def q_lines(sql: str) -> list:
     wrapped = f"LOAD '{SO}'; SET pgtantivy.index_dir='{IDX}'; {sql}"
     r = subprocess.run(["psql", "-tA", "-q", "-v", "ON_ERROR_STOP=1",
                         "-d", DB, "-c", wrapped],
                        env=ENV, capture_output=True, text=True, timeout=180)
     if r.returncode != 0:
         raise RuntimeError(f"SQL failed: {sql!r}\n{r.stderr}")
-    lines = [ln for ln in (r.stdout or "").splitlines() if ln.strip()]
-    return lines[-1].strip() if lines else ""
+    return [ln for ln in (r.stdout or "").splitlines() if ln.strip()]
 
 
 def main() -> int:
@@ -93,12 +98,13 @@ def main() -> int:
     op = int(re.search(r"opstamp (\d+)", exp).group(1))
     bundle = f"snap-{op}.bundle"
 
-    # ---- B. load_s3: open directly over S3 (range-read) ------------------
+    # ---- B. load_s3: open directly over S3 (range-read), no warm-up --------
     as_name = "snap_s3dir"
-    ld = q(f"SELECT pgtantivy_load_s3({creds}, {sqlq(bundle)}, {sqlq(as_name)});")
+    ld = q(f"SELECT pgtantivy_load_s3({creds}, {sqlq(bundle)}, {sqlq(as_name)}, NULL);")
     print("B. load_s3   :", ld)
     assert "loaded" in ld and "range-read" in ld, f"load_s3 shape: {ld!r}"
     assert "200 docs" in ld, f"doc count: {ld!r}"
+    assert "warmed" not in ld, f"no warm_terms passed, expect no warmed note: {ld!r}"
 
     # ---- C. proof: no local dir was created for the S3-loaded index ------
     local = os.path.join(IDX, as_name)
@@ -107,10 +113,7 @@ def main() -> int:
         f"load_s3 must NOT download to disk, but {local} exists"
 
     # ---- D. fresh backend: load_s3 + search in the SAME backend -----------
-    # (each q() is a fresh backend/empty registry, so load_s3 must precede the
-    # search in one statement list; both alpha+beta subqueries run in that one
-    # backend, so the 2nd is a within-backend warm read.)
-    d = q(f"SELECT pgtantivy_load_s3({creds}, {sqlq(bundle)}, {sqlq(as_name)}); "
+    d = q(f"SELECT pgtantivy_load_s3({creds}, {sqlq(bundle)}, {sqlq(as_name)}, NULL); "
           f"SELECT (SELECT count(*) FROM pgtantivy_search({sqlq(as_name)}, 'alpha', {N})) AS a, "
           f"(SELECT count(*) FROM pgtantivy_search({sqlq(as_name)}, 'beta', {N})) AS b;")
     parts = d.split("|")
@@ -119,10 +122,19 @@ def main() -> int:
         f"D search got {d!r}"
 
     # ---- E. reproducibility: a brand-new backend loads + searches again ---
-    e = q(f"SELECT pgtantivy_load_s3({creds}, {sqlq(bundle)}, {sqlq(as_name)}); "
+    e = q(f"SELECT pgtantivy_load_s3({creds}, {sqlq(bundle)}, {sqlq(as_name)}, NULL); "
           f"SELECT count(*) FROM pgtantivy_search({sqlq(as_name)}, 'alpha', {N});")
     print(f"E. fresh-backend re-load+search: alpha={e} (expect 100)")
     assert e == "100", f"alpha re-load got {e}"
+
+    # ---- F. query warm-up: load with warm_terms reports warmed + still 100 -
+    lines = q_lines(f"SELECT pgtantivy_load_s3({creds}, {sqlq(bundle)}, {sqlq(as_name)}, 'alpha,beta'); "
+                    f"SELECT count(*) FROM pgtantivy_search({sqlq(as_name)}, 'alpha', {N});")
+    first, second = lines[0].strip(), lines[1].strip()
+    print(f"F. warm-up   : {first}")
+    print(f"              alpha after warm = {second} (expect 100)")
+    assert "warmed: alpha, beta" in first, f"warm-up note missing: {first!r}"
+    assert second == "100", f"alpha after warm got {second!r}"
 
     # cleanup
     shutil.rmtree(IDX, ignore_errors=True)
