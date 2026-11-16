@@ -196,6 +196,22 @@ fn analyzer(lang: &str) -> TextAnalyzer {
 
 // ─── index registry: named in-memory tantivy indexes ─────────────────────────
 
+/// Connection info for an index loaded from S3 (approach 2) — kept alongside
+/// the live handle so `pgtantivy_reload_s3` can list versions / re-open the
+/// bundle without the caller re-supplying credentials. `None` = local index.
+#[derive(Clone, Debug)]
+struct S3Cred {
+    endpoint: String,
+    bucket: String,
+    region: String,
+    access_key: String,
+    secret_key: String,
+    prefix: String,
+    /// The base name (without the `-<opstamp>.bundle` suffix) — this is what
+    /// `list_versions` lists against to find published versions.
+    name: String,
+}
+
 struct PgIndex {
     index: Index,
     reader: IndexReader,
@@ -203,6 +219,9 @@ struct PgIndex {
     id: tantivy::schema::Field,
     /// On-disk directory when persistent (None for legacy in-memory only).
     path: Option<String>,
+    /// S3 origin when the index was loaded via `pgtantivy_load_s3` (approach 2);
+    /// lets `pgtantivy_reload_s3` upgrade/rollback without re-supplying creds.
+    s3: Option<S3Cred>,
 }
 
 fn index_root() -> String {
@@ -444,6 +463,7 @@ fn pgtantivy_create(
             body: body_field,
             id: id_field,
             path: Some(dir_path.to_string_lossy().into_owned()),
+            s3: None,
         }),
     );
     Ok(format!(
@@ -511,6 +531,7 @@ fn register_index_at(dir_path: &std::path::Path, name: &str) -> Result<u64, Box<
             body,
             id,
             path: Some(dir_path.to_string_lossy().into_owned()),
+            s3: None,
         }),
     );
     // Drift check: if the WAL has advanced since the index was last built,
@@ -790,35 +811,11 @@ fn pgtantivy_load_s3(
         return Err("pgtantivy: bundle_name must be '<name>-<opstamp>.bundle'".into());
     }
     let bundle_key_prefix = format!("{}/{}", prefix.trim_end_matches('/'), bundle_name);
-    let (index, lang) =
-        s3::open_s3_index(&endpoint, &bucket, &region, &access_key, &secret, &bundle_key_prefix)?;
-    index
-        .tokenizers()
-        .register(JIEBA_TOKENIZER, analyzer(&lang));
-    let schema = index.schema();
-    let body = schema
-        .get_field("body")
-        .map_err(|_| "pgtantivy: index lacks body field")?;
-    let id = schema
-        .get_field("id")
-        .map_err(|_| "pgtantivy: index lacks id field")?;
-    // Read-only S3 directory: no watch. Manual reload avoids the default
-    // OnCommitWithDelay policy (which would call watch() and fail).
-    let reader = index
-        .reader_builder()
-        .reload_policy(ReloadPolicy::Manual)
-        .try_into()?;
-    let num_docs = reader.searcher().num_docs();
-    registry().lock()?.insert(
-        as_name.clone(),
-        Arc::new(PgIndex {
-            index,
-            reader,
-            body,
-            id,
-            path: Some(format!("s3://{bucket}/{bundle_key_prefix}")),
-        }),
-    );
+    // Open directly over S3 (no local download) and register; the helper also
+    // stores the S3 origin so pgtantivy_reload_s3 can list/rollback later.
+    let (num_docs, lang) = open_s3_registered(
+        &endpoint, &bucket, &region, &access_key, &secret, &prefix, &bundle_name, &as_name,
+    )?;
     // Query warm-up: run a throwaway search per term so the hot splits (term
     // dict + postings + .store footers) are pulled into the per-process cache
     // NOW, instead of on the first real query (which would pay N cold RTTs).
@@ -850,6 +847,133 @@ fn pgtantivy_load_s3(
         "pgtantivy: loaded '{as_name}' from s3://{bucket}/{bundle_key_prefix} (range-read, {} docs, lang={lang}{warmed_note})",
         num_docs
     ))
+}
+
+/// Re-point an S3-loaded replica at another published bundle version, in place
+/// (same registry name). `to_bundle` = `NULL` upgrades to the NEWEST published
+/// version; a concrete bundle name ("snap-12.bundle") rolls back to that
+/// version. Reuses the S3 origin stored when the index was loaded via
+/// `pgtantivy_load_s3`, so the caller does not re-supply credentials. The
+/// replica keeps its name, so `pgtantivy_search('<name>', ...)` follows it.
+#[pg_extern]
+fn pgtantivy_reload_s3(name: String, to_bundle: Option<String>) -> Result<String, Box<dyn std::error::Error>> {
+    let s3 = {
+        let reg = registry().lock()?;
+        let idx = reg
+            .get(&name)
+            .ok_or_else(|| format!("pgtantivy: index '{name}' not loaded in this backend"))?;
+        let c = idx
+            .s3
+            .clone()
+            .ok_or_else(|| {
+                format!("pgtantivy: '{name}' is not an S3 replica (load it with pgtantivy_load_s3 first)")
+            })?;
+        let cur = idx
+            .path
+            .as_deref()
+            .map(|p| p.rsplit('/').next().unwrap_or("").to_string());
+        (c, cur)
+    };
+    let (cred, cur_bundle) = s3;
+    // Resolve the target bundle: explicit arg wins; NULL -> newest published.
+    let target = match to_bundle {
+        Some(b) if !b.trim().is_empty() => {
+            let b = b.trim().to_string();
+            if !b.ends_with(".bundle") {
+                return Err(format!("pgtantivy: to_bundle must be '<name>-<opstamp>.bundle' (got '{b}')").into());
+            }
+            b
+        }
+        _ => {
+            let versions = s3::list_versions(
+                &cred.endpoint, &cred.bucket, &cred.region,
+                &cred.access_key, &cred.secret_key, &cred.prefix, &cred.name,
+            )?;
+            match versions.first() {
+                Some((op, b, _)) => {
+                    // list_versions is newest-first; b is "<name>-<op>.bundle"
+                    let _ = op;
+                    b.clone()
+                }
+                None => {
+                    return Err(format!(
+                        "pgtantivy: no published bundles for '{}' ({}-<opstamp>.bundle) under {}/{}",
+                        cred.name, cred.name, cred.bucket, cred.prefix.trim_end_matches('/')
+                    ).into());
+                }
+            }
+        }
+    };
+    // No-op fast path: already serving that bundle.
+    if Some(target.clone()) == cur_bundle {
+        return Ok(format!(
+            "pgtantivy: replica '{name}' already serving {target} (no change)"
+        ));
+    }
+    open_s3_registered(
+        &cred.endpoint, &cred.bucket, &cred.region, &cred.access_key,
+        &cred.secret_key, &cred.prefix, &target, &name,
+    )?;
+    Ok(format!(
+        "pgtantivy: replica '{name}' reloaded -> {target} (was {})",
+        cur_bundle.unwrap_or_else(|| "?".into())
+    ))
+}
+
+/// Open an S3 index directly over the object store (range-read, no local
+/// download) and register it in the per-backend registry. Shared by
+/// `pgtantivy_load_s3` (first load) and `pgtantivy_reload_s3` (version
+/// upgrade / rollback).
+fn open_s3_registered(
+    endpoint: &str,
+    bucket: &str,
+    region: &str,
+    access_key: &str,
+    secret_key: &str,
+    prefix: &str,
+    bundle_name: &str,
+    as_name: &str,
+) -> Result<(u64, String), Box<dyn std::error::Error>> {
+    let bundle_key_prefix = format!("{}/{}", prefix.trim_end_matches('/'), bundle_name);
+    let (index, lang) = s3::open_s3_index(
+        endpoint, bucket, region, access_key, secret_key, &bundle_key_prefix,
+    )?;
+    index.tokenizers().register(JIEBA_TOKENIZER, analyzer(&lang));
+    let schema = index.schema();
+    let body = schema.get_field("body").map_err(|_| "pgtantivy: index lacks body field")?;
+    let id = schema.get_field("id").map_err(|_| "pgtantivy: index lacks id field")?;
+    // Read-only S3 directory: no watch. Manual reload avoids the default
+    // OnCommitWithDelay policy (which would call watch() and fail).
+    let reader: IndexReader = index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::Manual)
+        .try_into()?;
+    let num_docs = reader.searcher().num_docs();
+    // Base name ("snap-12.bundle" -> "snap"): what list_versions lists against.
+    let base_name = bundle_name
+        .strip_suffix(".bundle")
+        .and_then(|b| b.rsplit_once('-').map(|(n, _)| n.to_string()))
+        .unwrap_or_else(|| bundle_name.to_string());
+    registry().lock()?.insert(
+        as_name.to_string(),
+        Arc::new(PgIndex {
+            index,
+            reader,
+            body,
+            id,
+            path: Some(format!("s3://{bucket}/{bundle_key_prefix}")),
+            s3: Some(S3Cred {
+                endpoint: endpoint.to_string(),
+                bucket: bucket.to_string(),
+                region: region.to_string(),
+                access_key: access_key.to_string(),
+                secret_key: secret_key.to_string(),
+                prefix: prefix.to_string(),
+                name: base_name,
+            }),
+        }),
+    );
+    Ok((num_docs, lang))
 }
 
 /// List the published S3 bundle versions for `name` (those with a manifest),

@@ -415,6 +415,7 @@ unsafe extern "C" fn ambuild(
                 body: body_field,
                 id: id_field,
                 path: Some(dir_path.to_string_lossy().into_owned()),
+                s3: None,
             }),
         );
     }
@@ -597,6 +598,7 @@ unsafe fn run_query(relname: &str, query: &str, limit: usize) -> Option<Vec<(u64
                 body,
                 id,
                 path: Some(dir_path.to_string_lossy().into_owned()),
+                s3: None,
             }),
         );
         ctid_fields()
