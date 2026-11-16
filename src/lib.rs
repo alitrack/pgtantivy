@@ -25,6 +25,7 @@ pg_module_magic!();
 
 pub mod am;
 pub mod hybrid;
+pub mod snapshot;
 
 // GUC pgtantivy.index_dir: where persistent indexes live. Empty (the
 // default) resolves to $PGDATA/pgtantivy.
@@ -461,11 +462,28 @@ fn pgtantivy_load(name: String) -> Result<String, Box<dyn std::error::Error>> {
         return Ok(format!("pgtantivy: index '{}' already loaded", name));
     }
     let dir_path = std::path::Path::new(&index_root()).join(&name);
-    let dir = tantivy::directory::MmapDirectory::open(&dir_path)
-        .map_err(|e| format!("pgtantivy: no index '{}' on disk ({e})", name))?;
+    if !dir_path.exists() {
+        return Err(format!("pgtantivy: no index '{name}' on disk").into());
+    }
+    let num_docs = register_index_at(&dir_path, &name)?;
+    let lang = std::fs::read_to_string(dir_path.join("pgtantivy_meta.json"))
+        .ok()
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
+        .and_then(|v| v["lang"].as_str().map(std::string::ToString::to_string))
+        .unwrap_or_else(|| "chinese".to_string());
+    Ok(format!(
+        "pgtantivy: index '{}' loaded ({} docs, lang={})",
+        name, num_docs, lang
+    ))
+}
+
+/// Open an on-disk index directory and register it in this process's registry
+/// (tokenizer by sidecar lang, body/id field lookup, reader, drift warning).
+/// Shared by `pgtantivy_load` and `pgtantivy_import_index`. Returns doc count.
+fn register_index_at(dir_path: &std::path::Path, name: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let dir = tantivy::directory::MmapDirectory::open(dir_path)
+        .map_err(|e| format!("pgtantivy: no index '{name}' on disk ({e})"))?;
     let index = Index::open(dir)?;
-    let meta = index.tokenizers();
-    let _ = meta;
     // Tokenizer: jieba for any index we created (language recorded in meta.json).
     let lang = std::fs::read_to_string(dir_path.join("pgtantivy_meta.json"))
         .ok()
@@ -485,7 +503,7 @@ fn pgtantivy_load(name: String) -> Result<String, Box<dyn std::error::Error>> {
     let reader = index.reader()?;
     let num_docs = reader.searcher().num_docs();
     registry().lock()?.insert(
-        name.clone(),
+        name.to_string(),
         Arc::new(PgIndex {
             index,
             reader,
@@ -496,7 +514,7 @@ fn pgtantivy_load(name: String) -> Result<String, Box<dyn std::error::Error>> {
     );
     // Drift check: if the WAL has advanced since the index was last built,
     // the snapshot may be stale — warn (not error) so callers can decide.
-    let drift = check_drift(&dir_path);
+    let drift = check_drift(dir_path);
     if drift.drifted {
         if let Some(a) = &drift.anchor {
             warning!(
@@ -508,10 +526,7 @@ fn pgtantivy_load(name: String) -> Result<String, Box<dyn std::error::Error>> {
             );
         }
     }
-    Ok(format!(
-        "pgtantivy: index '{}' loaded ({} docs, lang={})",
-        name, num_docs, lang
-    ))
+    Ok(num_docs)
 }
 
 /// Drift check for a named sidecar: true if the WAL has advanced since the
@@ -564,6 +579,87 @@ fn pgtantivy_touch(name: String) -> Result<String, Box<dyn std::error::Error>> {
         "pgtantivy: anchor for '{name}' refreshed to {}",
         fmt_lsn(anchor.built_lsn)
     ))
+}
+
+// ─── 方案 1：不可变 snapshot bundle 导出/导入（多实例共享索引的承重核心） ──────
+// Research #2026111601 §5 推荐路线的第一步："先用「快照 bundle 导出/导入 + 版本号
+// + 单写者」把多实例共享跑起来（最小可用、风险可控，复用 duckdb-tantivy 现成
+// save/load 思路）"。纯文件层逻辑在 src/snapshot.rs；这里是 SQL 面 + registry 接线。
+
+/// Snapshot a named on-disk index into an immutable, versioned **bundle** at
+/// `<dest>/<name>-<opstamp>.bundle/` (a copy of the index dir + a manifest.json
+/// with opstamp / writer_id / doc count / per-file size+FNV checksum). Written
+/// to a temp dir then atomically renamed, so a crash never leaves a half-written
+/// bundle and the writer's live index is untouched (copy-on-export).
+///
+/// `writer_id` is the single-writer fence tag (default: `<hostname>.<pid>`).
+/// Bundles are the transfer unit to a reader instance (copy to the other node,
+/// then `pgtantivy_import_index`); S3 is 方案 2 (same format, drop-in).
+#[pg_extern]
+fn pgtantivy_export_index(
+    name: String,
+    dest: String,
+    writer_id: Option<String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if !safe_name(&name) {
+        return Err("pgtantivy: name must be [A-Za-z_][A-Za-z0-9_-]*, <=128 chars".into());
+    }
+    let dir_path = std::path::Path::new(&index_root()).join(&name);
+    if !dir_path.exists() {
+        return Err(format!("pgtantivy: no index '{name}' on disk").into());
+    }
+    let (bundle, opstamp, n_files) =
+        snapshot::export_bundle(&name, &dir_path, &dest, writer_id)?;
+    Ok(format!(
+        "pgtantivy: exported '{name}' opstamp {opstamp} ({n_files} files) to {}",
+        bundle.display()
+    ))
+}
+
+/// Import (verify + extract + register) a bundle as index `as_name` in this
+/// instance. Verifies every file's size + checksum against the manifest (a
+/// corrupted/tampered bundle is rejected, never silently loaded), extracts to
+/// `<index_root>/<as_name>/`, confirms the doc count, and registers it so
+/// `pgtantivy_search` works immediately. The extracted index keeps its sidecar
+/// drift anchor, so `pgtantivy_drift_check('as_name')` still signals staleness.
+#[pg_extern]
+fn pgtantivy_import_index(bundle: String, as_name: String) -> Result<String, Box<dyn std::error::Error>> {
+    if !safe_name(&as_name) {
+        return Err("pgtantivy: import name must be [A-Za-z_][A-Za-z0-9_-]*, <=128 chars".into());
+    }
+    let bundle_path = std::path::Path::new(bundle.trim());
+    if !bundle_path.is_dir() {
+        return Err(format!("pgtantivy: no such bundle directory {bundle:?}").into());
+    }
+    {
+        let reg = registry().lock()?;
+        if reg.contains_key(&as_name) {
+            return Err(format!(
+                "pgtantivy: index '{as_name}' already loaded in this session; \
+                 import under a different name"
+            )
+            .into());
+        }
+    }
+    let root = index_root();
+    let target = std::path::Path::new(&root).join(&as_name);
+    let meta = snapshot::extract_bundle(bundle_path, &target)?;
+    let n_docs = register_index_at(&target, &as_name)?;
+    Ok(format!(
+        "pgtantivy: imported '{as_name}' from {} (opstamp {}, {} docs, writer {})",
+        target.display(),
+        meta.opstamp,
+        n_docs,
+        meta.writer_id
+    ))
+}
+
+/// Describe a bundle (verify its manifest) as a JSON string: name, opstamp,
+/// writer_id, doc count, language, file count, and the build-time LSN anchor.
+/// Pure (no registry) — usable on any node to inspect a bundle before import.
+#[pg_extern]
+fn pgtantivy_bundle_info(bundle: String) -> Result<String, Box<dyn std::error::Error>> {
+    snapshot::bundle_info(&bundle)
 }
 
 /// Incrementally append documents to an existing (loaded) index.

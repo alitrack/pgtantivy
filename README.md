@@ -48,6 +48,17 @@ SELECT pgtantivy_touch('docs_idx');        -- push the anchor to now (fresh)
 -- pgtantivy_add / pgtantivy_remove / trigger flush also refresh the anchor;
 -- a stale index warns on pgtantivy_load but is still queryable.
 
+-- snapshot bundle: portable, versioned, integrity-checked index transfer
+-- (research #2026111601 "共享索引" approach 1). Export a named index to an
+-- immutable bundle dir; verify it; import it on another node as a new index.
+SELECT pgtantivy_export_index('docs_idx', '/data/bundles', 'writer-A');
+-- → /data/bundles/docs_idx-<opstamp>.bundle  (manifest + all segment files)
+SELECT pgtantivy_bundle_info('/data/bundles/docs_idx-1.bundle');  -- manifest JSON
+SELECT pgtantivy_import_index('/data/bundles/docs_idx-1.bundle', 'docs_replica');
+-- import verifies every file's size + FNV checksum against the manifest;
+-- a corrupted/tampered bundle is rejected, never silently loaded. opstamp
+-- monotonically increases with each export (bumps on any write).
+
 -- trigger auto-sync: index tracks the table, one tantivy commit per txn
 CREATE TRIGGER pgtantivy_sync
   AFTER INSERT OR UPDATE OR DELETE ON docs
@@ -67,6 +78,7 @@ SET pgtantivy.index_dir = '/data/fti';
 - **Trigger batching**: row triggers buffer ops; a PRE_COMMIT xact callback flushes per-index (one tantivy commit per index per transaction). An ABORT callback drains the buffer — without it, rolled-back ops leak into the next transaction's flush.
 - **Process-level registry**: loaded indexes live in a process-wide map; after a restart or in a new backend, `pgtantivy_load()` re-mmaps from disk. The disk is the source of truth.
 - **Drift detection**: each build (`pgtantivy_create` / `CREATE INDEX` / `REINDEX`) and each incremental write (`pgtantivy_add` / `remove` / trigger flush) records the current WAL insertion LSN — read from the live postgres runtime via the exported `GetInsertRecPtr` symbol — plus a timestamp + doc count in the `pgtantivy_meta.json` sidecar. `pgtantivy_drift_check(name)` compares that anchor to the live WAL position: `true` means "the WAL moved since this index was last built/written". Honest caveat: the LSN is global to the cluster, so DML on *unrelated* tables also advances it — `drifted = true` is a staleness *signal*, not "this index's table changed". `pgtantivy_touch(name)` manually pushes the anchor forward (after an out-of-band sync); a stale index warns on `pgtantivy_load` but remains queryable.
+- **Snapshot bundles**: `pgtantivy_export_index` copies the index dir into `<dest>/<name>-<opstamp>.bundle/` with a `manifest.json` (format tag, opstamp, writer_id, doc count, build-time LSN anchor, and a per-file size + FNV-1a 64-bit checksum for every segment file). `pgtantivy_import_index` re-verifies all checksums before extracting, so a corrupted or tampered bundle is rejected — never silently loaded. The opstamp is read from / bumped in the index sidecar, so it rises monotonically with each export and is the versioning key for consumers. The `writer_id` marker documents the single-writer contract of the source index. Verified end-to-end on a real PG17 cluster (`tests/snapshot_e2e.py`): export → info → import → fresh-backend search (100/100 hits on a 200-doc corpus) → opstamp bump after a write → corrupt-a-byte import rejection.
 - **Ranking**: conjunction (AND) BM25. Verified 1.00 recall@10 on unique-term ground truth; common-word TF ranking behaves per spec (see `tests/bench_recall.py` for the ground-truth methodology).
 
 ## Build & install
@@ -91,6 +103,16 @@ SELECT pgtantivy_touch('docs_idx');        -- push the anchor forward (fresh now
 
 Every build/`REINDEX`/incremental write records the current WAL insertion LSN (read via postgres' exported `GetInsertRecPtr` symbol) + timestamp + doc count in the sidecar; `pgtantivy_drift_check` compares it to the live WAL position. Caveat: the LSN is global to the cluster, so it's a staleness *signal*, not "this table changed". Verified end-to-end on a real PG17 cluster (`tests/drift_e2e.sql`): build→f, WAL advance→t, touch→f, add→f, search still returns correct rows.
 
+**Snapshot bundles** (portable, versioned, integrity-checked index transfer, research #2026111601 "共享索引" approach 1):
+
+```sql
+SELECT pgtantivy_export_index('docs_idx', '/data/bundles', 'writer-A');
+SELECT pgtantivy_bundle_info('/data/bundles/docs_idx-1.bundle');
+SELECT pgtantivy_import_index('/data/bundles/docs_idx-1.bundle', 'docs_replica');
+```
+
+Export writes `<dest>/<name>-<opstamp>.bundle/` (manifest + every segment file, each with a size + FNV-1a checksum). Import re-verifies all checksums before extracting — a corrupted/tampered bundle is rejected, never silently loaded. The opstamp is the version key (monotonic, bumps on any write); `writer_id` records the single-writer source. The extracted replica keeps its build-time drift anchor, so `pgtantivy_drift_check('docs_replica')` still signals staleness. Verified end-to-end (`tests/snapshot_e2e.py`): export → info → import → fresh-backend search 100/100 → opstamp bump after a write → corrupt-a-byte rejection.
+
 **v0.4.0** — hybrid search, server-side:
 
 ```sql
@@ -112,4 +134,4 @@ One MIT extension + pgvector = Elasticsearch-style hybrid search without leaving
 v0.2.0 — persistence, incremental writes, trigger sync, snippets, GUCs.
 v0.1.0 — initial prototype.
 
-E2E suites in `tests/`: `persist_e2e.sql`, `incremental_e2e.sql`, `trigger_sync_e2e.sql`, `drift_e2e.sql`, `bench_*.py` (100k-row corpus, recall harness).
+E2E suites in `tests/`: `persist_e2e.sql`, `incremental_e2e.sql`, `trigger_sync_e2e.sql`, `drift_e2e.sql`, `snapshot_e2e.py`, `bench_*.py` (100k-row corpus, recall harness).
