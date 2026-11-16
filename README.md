@@ -39,6 +39,15 @@ SELECT pgtantivy_add('docs_idx',
   '[{"id": 90001, "text": "量子比特的相干时间是量子计算核心指标"}]');
 SELECT pgtantivy_remove('docs_idx', ARRAY[90002]);
 
+-- drift detection: the index is a snapshot. Every build/write records the
+-- current WAL LSN as a staleness anchor; compare it against the live position.
+SELECT pgtantivy_drift_check('docs_idx');  -- false right after a build/write
+-- (returns true once the WAL has advanced past the anchor — DML on ANY table
+--  moves it, so treat it as a staleness *signal*, not a correctness gate)
+SELECT pgtantivy_touch('docs_idx');        -- push the anchor to now (fresh)
+-- pgtantivy_add / pgtantivy_remove / trigger flush also refresh the anchor;
+-- a stale index warns on pgtantivy_load but is still queryable.
+
 -- trigger auto-sync: index tracks the table, one tantivy commit per txn
 CREATE TRIGGER pgtantivy_sync
   AFTER INSERT OR UPDATE OR DELETE ON docs
@@ -57,6 +66,7 @@ SET pgtantivy.index_dir = '/data/fti';
 - **Incremental correctness**: the `id` field is `INDEXED | STORED | FAST` — `delete_term` needs the term dictionary; FAST-only ids make upsert/remove silently no-op with ghost duplicates.
 - **Trigger batching**: row triggers buffer ops; a PRE_COMMIT xact callback flushes per-index (one tantivy commit per index per transaction). An ABORT callback drains the buffer — without it, rolled-back ops leak into the next transaction's flush.
 - **Process-level registry**: loaded indexes live in a process-wide map; after a restart or in a new backend, `pgtantivy_load()` re-mmaps from disk. The disk is the source of truth.
+- **Drift detection**: each build (`pgtantivy_create` / `CREATE INDEX` / `REINDEX`) and each incremental write (`pgtantivy_add` / `remove` / trigger flush) records the current WAL insertion LSN — read from the live postgres runtime via the exported `GetInsertRecPtr` symbol — plus a timestamp + doc count in the `pgtantivy_meta.json` sidecar. `pgtantivy_drift_check(name)` compares that anchor to the live WAL position: `true` means "the WAL moved since this index was last built/written". Honest caveat: the LSN is global to the cluster, so DML on *unrelated* tables also advances it — `drifted = true` is a staleness *signal*, not "this index's table changed". `pgtantivy_touch(name)` manually pushes the anchor forward (after an out-of-band sync); a stale index warns on `pgtantivy_load` but remains queryable.
 - **Ranking**: conjunction (AND) BM25. Verified 1.00 recall@10 on unique-term ground truth; common-word TF ranking behaves per spec (see `tests/bench_recall.py` for the ground-truth methodology).
 
 ## Build & install
@@ -70,6 +80,16 @@ cargo pgrx install --pg17   # if pgrx-managed PG
 Requires: PostgreSQL 17, pgrx 0.13.1, tantivy 0.24, jieba-rs 0.7.
 
 ## Status
+
+**Drift detection** (snapshot staleness, research #2026111601 "漂移检测" line) — the index is a snapshot: after a build or incremental write, heap DML is not re-indexed (documented MVP contract), so staleness is *made visible* instead of silently wrong.
+
+```sql
+SELECT pgtantivy_drift_check('docs_idx');  -- f right after build; t once WAL advances
+SELECT pgtantivy_touch('docs_idx');        -- push the anchor forward (fresh now)
+-- add/remove/trigger flush refresh the anchor; a stale index warns on load.
+```
+
+Every build/`REINDEX`/incremental write records the current WAL insertion LSN (read via postgres' exported `GetInsertRecPtr` symbol) + timestamp + doc count in the sidecar; `pgtantivy_drift_check` compares it to the live WAL position. Caveat: the LSN is global to the cluster, so it's a staleness *signal*, not "this table changed". Verified end-to-end on a real PG17 cluster (`tests/drift_e2e.sql`): build→f, WAL advance→t, touch→f, add→f, search still returns correct rows.
 
 **v0.4.0** — hybrid search, server-side:
 
@@ -92,4 +112,4 @@ One MIT extension + pgvector = Elasticsearch-style hybrid search without leaving
 v0.2.0 — persistence, incremental writes, trigger sync, snippets, GUCs.
 v0.1.0 — initial prototype.
 
-E2E suites in `tests/`: `persist_e2e.sql`, `incremental_e2e.sql`, `trigger_sync_e2e.sql`, `bench_*.py` (100k-row corpus, recall harness).
+E2E suites in `tests/`: `persist_e2e.sql`, `incremental_e2e.sql`, `trigger_sync_e2e.sql`, `drift_e2e.sql`, `bench_*.py` (100k-row corpus, recall harness).

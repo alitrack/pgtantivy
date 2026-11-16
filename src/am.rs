@@ -11,11 +11,16 @@
 //! Storage remains the v0.2 sidecar layout under $PGDATA/pgtantivy/<name>/.
 //! WAL/recovery contract unchanged (documented: REINDEX after crash).
 
-use crate::{index_root, lookup, nfc, registry, sanitize, PgIndex, JIEBA_TOKENIZER, analyzer};
+use crate::{
+    analyzer, index_root, lookup, nfc, now_millis, reader_docs, registry, sanitize,
+    write_build_meta, BuildAnchor, PgIndex, JIEBA_TOKENIZER,
+};
+use pgrx::prelude::*;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
-use pgrx::prelude::*;
-use tantivy::schema::{IndexRecordOption, TextFieldIndexing, TextOptions, Value, INDEXED, STORED, FAST};
+use tantivy::schema::{
+    IndexRecordOption, TextFieldIndexing, TextOptions, Value, FAST, INDEXED, STORED,
+};
 
 // ── handler ──────────────────────────────────────────────────────────────
 
@@ -35,9 +40,15 @@ unsafe extern "C" fn amcostestimate(
     // scans with NO index clauses (e.g. SELECT count(*) FROM t) — the scan
     // then runs with no query key and returns nothing. An AM without usable
     // clauses must price itself out.
-    let nclauses = if path.is_null() { 0 } else {
+    let nclauses = if path.is_null() {
+        0
+    } else {
         let l = (*path).indexclauses;
-        if l.is_null() { 0 } else { (*l).length }
+        if l.is_null() {
+            0
+        } else {
+            (*l).length
+        }
     };
     if nclauses <= 0 {
         *index_startup_cost = f64::MAX / 2.0;
@@ -101,37 +112,38 @@ CREATE OPERATOR CLASS pgtantivy_ops DEFAULT FOR TYPE text USING pgtantivy FAMILY
 ")]
 fn pgtantivy_am_handler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine> {
     let amroutine = unsafe {
-        let n = pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexAmRoutine>()) as *mut pg_sys::IndexAmRoutine;
+        let n = pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexAmRoutine>())
+            as *mut pg_sys::IndexAmRoutine;
         (*n).type_ = pg_sys::NodeTag::T_IndexAmRoutine;
         n
     };
 
     unsafe {
-    // Strategy 1 = `@@@` (declared in the pgtantivy_ops operator family via
-    // the pgrx-embedded SQL). amstrategies must cover it or the planner can
-    // never form an index path — with 0, `body @@@ 'q'` degenerates to a seq
-    // scan running the naive substring fallback per row (pit #10: measured
-    // 91ms/q + 4/9 recall on the 100k bench vs 0.2ms/9/9 for the BM25 path).
-    (*amroutine).amstrategies = 1;
-    (*amroutine).amsupport = 0;
-    (*amroutine).amcanmulticol = false;
-    (*amroutine).amoptionalkey = true;
-    (*amroutine).amcanparallel = false;
-    (*amroutine).amkeytype = pg_sys::InvalidOid;
+        // Strategy 1 = `@@@` (declared in the pgtantivy_ops operator family via
+        // the pgrx-embedded SQL). amstrategies must cover it or the planner can
+        // never form an index path — with 0, `body @@@ 'q'` degenerates to a seq
+        // scan running the naive substring fallback per row (pit #10: measured
+        // 91ms/q + 4/9 recall on the 100k bench vs 0.2ms/9/9 for the BM25 path).
+        (*amroutine).amstrategies = 1;
+        (*amroutine).amsupport = 0;
+        (*amroutine).amcanmulticol = false;
+        (*amroutine).amoptionalkey = true;
+        (*amroutine).amcanparallel = false;
+        (*amroutine).amkeytype = pg_sys::InvalidOid;
 
-    (*amroutine).amvalidate = Some(validate as _);
-    (*amroutine).amoptions = Some(amoptions as _);
-    (*amroutine).amcostestimate = Some(amcostestimate as _);
-    (*amroutine).ambuild = Some(ambuild as _);
-    (*amroutine).ambuildempty = Some(ambuildempty as _);
-    (*amroutine).aminsert = Some(aminsert as _);
-    (*amroutine).ambulkdelete = Some(ambulkdelete as _);
-    (*amroutine).amvacuumcleanup = Some(amvacuumcleanup as _);
-    (*amroutine).ambeginscan = Some(ambeginscan as _);
-    (*amroutine).amrescan = Some(amrescan as _);
-    (*amroutine).amendscan = Some(amendscan as _);
-    (*amroutine).amgettuple = None; // bitmap-only for now
-    (*amroutine).amgetbitmap = Some(amgetbitmap as _);
+        (*amroutine).amvalidate = Some(validate as _);
+        (*amroutine).amoptions = Some(amoptions as _);
+        (*amroutine).amcostestimate = Some(amcostestimate as _);
+        (*amroutine).ambuild = Some(ambuild as _);
+        (*amroutine).ambuildempty = Some(ambuildempty as _);
+        (*amroutine).aminsert = Some(aminsert as _);
+        (*amroutine).ambulkdelete = Some(ambulkdelete as _);
+        (*amroutine).amvacuumcleanup = Some(amvacuumcleanup as _);
+        (*amroutine).ambeginscan = Some(ambeginscan as _);
+        (*amroutine).amrescan = Some(amrescan as _);
+        (*amroutine).amendscan = Some(amendscan as _);
+        (*amroutine).amgettuple = None; // bitmap-only for now
+        (*amroutine).amgetbitmap = Some(amgetbitmap as _);
     }
 
     unsafe { PgBox::from_pg(amroutine) }
@@ -161,10 +173,12 @@ struct PgtantivyOpts {
 static mut PGT_KIND: pg_sys::relopt_kind::Type = 0;
 
 /// relname -> tantivy ctid field handle (populated at ambuild).
-static CTID_FIELDS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, tantivy::schema::Field>>> =
-    std::sync::OnceLock::new();
+static CTID_FIELDS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, tantivy::schema::Field>>,
+> = std::sync::OnceLock::new();
 
-fn ctid_fields() -> &'static std::sync::Mutex<std::collections::HashMap<String, tantivy::schema::Field>> {
+fn ctid_fields(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, tantivy::schema::Field>> {
     CTID_FIELDS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -185,9 +199,12 @@ unsafe fn ensure_relopt_kind(pgt_kind: *mut pg_sys::relopt_kind::Type) {
             ("id_column", "id column", "id"),
             ("language", "tokenizer language", "chinese"),
         ] {
-            let mut cname = name.as_bytes().to_vec(); cname.push(0);
-            let mut cdesc = desc.as_bytes().to_vec(); cdesc.push(0);
-            let mut cdflt = dflt.as_bytes().to_vec(); cdflt.push(0);
+            let mut cname = name.as_bytes().to_vec();
+            cname.push(0);
+            let mut cdesc = desc.as_bytes().to_vec();
+            cdesc.push(0);
+            let mut cdflt = dflt.as_bytes().to_vec();
+            cdflt.push(0);
             pg_sys::add_string_reloption(
                 kind,
                 cname.as_ptr() as *const std::ffi::c_char,
@@ -203,21 +220,21 @@ unsafe fn ensure_relopt_kind(pgt_kind: *mut pg_sys::relopt_kind::Type) {
 
 fn relopt_table() -> [pg_sys::relopt_parse_elt; 3] {
     [
-    pg_sys::relopt_parse_elt {
-        optname: c"text_column".as_ptr(),
-        opttype: pg_sys::relopt_type::RELOPT_TYPE_STRING,
-        offset: std::mem::offset_of!(PgtantivyOpts, text_column_off) as i32,
-    },
-    pg_sys::relopt_parse_elt {
-        optname: c"id_column".as_ptr(),
-        opttype: pg_sys::relopt_type::RELOPT_TYPE_STRING,
-        offset: std::mem::offset_of!(PgtantivyOpts, id_column_off) as i32,
-    },
-    pg_sys::relopt_parse_elt {
-        optname: c"language".as_ptr(),
-        opttype: pg_sys::relopt_type::RELOPT_TYPE_STRING,
-        offset: std::mem::offset_of!(PgtantivyOpts, language_off) as i32,
-    },
+        pg_sys::relopt_parse_elt {
+            optname: c"text_column".as_ptr(),
+            opttype: pg_sys::relopt_type::RELOPT_TYPE_STRING,
+            offset: std::mem::offset_of!(PgtantivyOpts, text_column_off) as i32,
+        },
+        pg_sys::relopt_parse_elt {
+            optname: c"id_column".as_ptr(),
+            opttype: pg_sys::relopt_type::RELOPT_TYPE_STRING,
+            offset: std::mem::offset_of!(PgtantivyOpts, id_column_off) as i32,
+        },
+        pg_sys::relopt_parse_elt {
+            optname: c"language".as_ptr(),
+            opttype: pg_sys::relopt_type::RELOPT_TYPE_STRING,
+            offset: std::mem::offset_of!(PgtantivyOpts, language_off) as i32,
+        },
     ]
 }
 
@@ -231,9 +248,13 @@ unsafe fn read_reloptions(index_rel: pg_sys::Relation) -> (Option<String>, Optio
     // (GET_STRING_RELOPTION semantics).
     let base = rd_opts as *mut u8;
     let take = |off: i32| -> Option<String> {
-        if off == 0 { return None; }
+        if off == 0 {
+            return None;
+        }
         let p = base.offset(off as isize) as *const std::ffi::c_char;
-        if p.is_null() { None } else {
+        if p.is_null() {
+            None
+        } else {
             Some(std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned())
         }
     };
@@ -294,7 +315,10 @@ unsafe extern "C" fn ambuild(
         }
     }
     if text_attn < 0 || id_attn < 0 {
-        error!("pgtantivy: reloptions must name existing columns: text_column={}, id_column={}", text_col, id_col);
+        error!(
+            "pgtantivy: reloptions must name existing columns: text_column={}, id_column={}",
+            text_col, id_col
+        );
     }
 
     // Build the tantivy sidecar (same layout as pgtantivy_create).
@@ -324,7 +348,6 @@ unsafe extern "C" fn ambuild(
         dir_path.join("pgtantivy_meta.json"),
         serde_json::json!({"lang": lang}).to_string(),
     );
-
     let mut writer = tindex
         .writer(32 * 1024 * 1024)
         .unwrap_or_else(|e| error!("pgtantivy: writer failed: {e}"));
@@ -351,7 +374,9 @@ unsafe extern "C" fn ambuild(
             | ((tid.ip_blkid.bi_lo as u64) << 32)
             | (tid.ip_posid as u64);
         let cstr = pg_sys::text_to_cstring(text_datum.cast_mut_ptr::<pg_sys::text>());
-        let text = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+        let text = std::ffi::CStr::from_ptr(cstr)
+            .to_string_lossy()
+            .into_owned();
         let text_nfc = nfc(&text);
         writer
             .add_document(tantivy::doc!(id_field => id, ctid_field => ctid_val, body_field => text_nfc.as_str()))
@@ -364,11 +389,23 @@ unsafe extern "C" fn ambuild(
         .unwrap_or_else(|e| error!("pgtantivy: commit failed: {e}"));
     let _ = index_info;
 
+    // Drift anchor: record the build-time LSN so pgtantivy_drift_check can
+    // flag the snapshot as stale once the WAL advances past it.
+    let anchor = BuildAnchor {
+        built_lsn: crate::current_insertion_lsn(),
+        built_at: now_millis(),
+        n_docs: state.n_docs as u64,
+    };
+    let _ = write_build_meta(&dir_path, &anchor);
+
     // Register in the in-process registry under the index relname.
     let reader = tindex
         .reader()
         .unwrap_or_else(|e| error!("pgtantivy: reader failed: {e}"));
-    ctid_fields().lock().map(|mut m| m.insert(relname.clone(), ctid_field)).ok();
+    ctid_fields()
+        .lock()
+        .map(|mut m| m.insert(relname.clone(), ctid_field))
+        .ok();
     if let Ok(mut reg) = registry().lock() {
         reg.insert(
             relname.clone(),
@@ -383,7 +420,8 @@ unsafe extern "C" fn ambuild(
     }
 
     // Build result: PG wants an IndexBuildResult (heap tuples count etc).
-    let result = pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexBuildResult>()) as *mut pg_sys::IndexBuildResult;
+    let result = pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexBuildResult>())
+        as *mut pg_sys::IndexBuildResult;
     (*result).heap_tuples = state.n_docs as f64;
     (*result).index_tuples = state.n_docs as f64;
     result
@@ -455,7 +493,9 @@ unsafe fn query_from_scankeys(scan: pg_sys::IndexScanDesc) -> Option<String> {
     if cstr.is_null() {
         return None;
     }
-    let s = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+    let s = std::ffi::CStr::from_ptr(cstr)
+        .to_string_lossy()
+        .into_owned();
     pg_sys::pfree(cstr.cast());
     Some(s)
 }
@@ -482,11 +522,10 @@ unsafe extern "C" fn amrescan(
     }
     let hits = match query_from_scankeys(scan) {
         Some(q) => {
-            let relname = std::ffi::CStr::from_ptr(
-                (*(*sd.indexRelation).rd_rel).relname.data.as_ptr(),
-            )
-            .to_string_lossy()
-            .into_owned();
+            let relname =
+                std::ffi::CStr::from_ptr((*(*sd.indexRelation).rd_rel).relname.data.as_ptr())
+                    .to_string_lossy()
+                    .into_owned();
             let r = run_query(&relname, &q, 10_000);
             r.unwrap_or_default()
         }
@@ -542,7 +581,9 @@ unsafe fn run_query(relname: &str, query: &str, limit: usize) -> Option<Vec<(u64
             .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
             .and_then(|v| v["lang"].as_str().map(std::string::ToString::to_string))
             .unwrap_or_else(|| "chinese".to_string());
-        index.tokenizers().register(JIEBA_TOKENIZER, analyzer(&lang));
+        index
+            .tokenizers()
+            .register(JIEBA_TOKENIZER, analyzer(&lang));
         let schema = index.schema();
         let body = schema.get_field("body").ok()?;
         let id = schema.get_field("id").ok()?;
@@ -550,10 +591,18 @@ unsafe fn run_query(relname: &str, query: &str, limit: usize) -> Option<Vec<(u64
         let reader = index.reader().ok()?;
         registry().lock().ok()?.insert(
             relname.to_string(),
-            std::sync::Arc::new(PgIndex { index: index.clone(), reader, body, id,
-                path: Some(dir_path.to_string_lossy().into_owned()) }),
+            std::sync::Arc::new(PgIndex {
+                index: index.clone(),
+                reader,
+                body,
+                id,
+                path: Some(dir_path.to_string_lossy().into_owned()),
+            }),
         );
-        ctid_fields().lock().ok()?.insert(relname.to_string(), ctid_f);
+        ctid_fields()
+            .lock()
+            .ok()?
+            .insert(relname.to_string(), ctid_f);
     }
     let idx = lookup(relname).ok()?;
     let searcher = idx.reader.searcher();

@@ -1,12 +1,13 @@
 // pgtantivy — Chinese-first BM25 full-text search for PostgreSQL via tantivy.
 // Seam B prototype: tantivy BM25 + jieba tokenization in a pgrx extension.
 // MIT. No ParadeDB code — clean-room, architecture-inspired only.
-use pgrx::prelude::*;
-use pgrx::pgbox::WhoAllocated;
 use pgrx::callbacks::{register_xact_callback, PgXactCallbackEvent};
+use pgrx::pgbox::WhoAllocated;
+use pgrx::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use std::ffi::CStr;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::{
@@ -17,7 +18,6 @@ use tantivy::tokenizer::{
     LowerCaser, SimpleTokenizer, TextAnalyzer, Token, TokenStream, Tokenizer,
 };
 use tantivy::{doc, Index, IndexReader};
-use std::ffi::CStr;
 
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use unicode_normalization::UnicodeNormalization;
@@ -28,7 +28,8 @@ pub mod hybrid;
 
 // GUC pgtantivy.index_dir: where persistent indexes live. Empty (the
 // default) resolves to $PGDATA/pgtantivy.
-static INDEX_DIR_GUC: GucSetting<Option<&'static CStr>> = GucSetting::<Option<&'static CStr>>::new(None);
+static INDEX_DIR_GUC: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(None);
 
 // GUC pgtantivy.merge_threshold: auto-compact after an incremental write
 // leaves this many searchable segments (0 = never; manual-only via
@@ -104,8 +105,6 @@ fn merge_all(idx: &PgIndex) -> Result<(), Box<dyn std::error::Error>> {
     idx.reader.reload()?;
     Ok(())
 }
-
-
 
 // ─── jieba tokenizer adapter (tantivy Tokenizer) ─────────────────────────────
 
@@ -223,6 +222,142 @@ fn registry() -> &'static Mutex<HashMap<String, Arc<PgIndex>>> {
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// ── drift detection: build-time anchor in pgtantivy_meta.json ─────────────
+// The AM index is a snapshot: after CREATE/REINDEX, DML on the heap is
+// never indexed (aminsert is a no-op — documented MVP contract). To make
+// staleness *visible* instead of silently wrong, every build records the
+// current WAL insertion LSN + timestamp in the sidecar's
+// pgtantivy_meta.json, and incremental writers (add/remove/trigger flush)
+// refresh it. `pgtantivy_drift_check` compares the anchor against the
+// live WAL position.
+//
+// Honest caveat: the insertion LSN is global to the whole cluster — DML on
+// UNRELATED tables also advances it, so `drifted=true` means "WAL moved
+// since the index was built", not "this index's table changed". Treat it as
+// a staleness signal; `pgtantivy_reindex` refreshes when in doubt.
+extern "C" {
+    /// Postgres' canonical "current WAL insertion position" accessor. It returns
+    /// `XLogRecPtr` (uint64) and IS in postgres' dynamic symbol table, so the
+    /// cdylib's LOAD-time dynamic linker can resolve it. (The earlier draft used
+    /// `GetCurrentInsertionLSN`, which postgres does NOT export — the cdylib
+    /// compiled but failed at `LOAD` with `undefined symbol`.)
+    fn GetInsertRecPtr() -> u64;
+}
+
+/// Current WAL insertion LSN, read directly from the postgres runtime via the
+/// exported `GetInsertRecPtr` symbol (the cdylib is loaded into postgres, so the
+/// dynamic linker resolves it at LOAD time — the standard extension pattern).
+pub fn current_insertion_lsn() -> u64 {
+    unsafe { GetInsertRecPtr() }
+}
+
+/// Build-time anchor for drift detection.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct BuildAnchor {
+    /// Global WAL insertion LSN at build/last-refresh time.
+    pub built_lsn: u64,
+    /// Unix millis at build/last-refresh time.
+    pub built_at: i64,
+    /// Docs indexed at build/last-refresh time.
+    pub n_docs: u64,
+}
+
+pub fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Doc count of a freshly-committed index (reader opened, then dropped).
+fn reader_docs(index: &tantivy::Index) -> u64 {
+    index.reader().map(|r| r.searcher().num_docs()).unwrap_or(0)
+}
+
+/// Read + merge the sidecar meta (keeps `lang` and any other keys, adds the
+/// anchor). Atomic write via temp-file + rename so a crash never leaves a
+/// half-written meta.
+pub fn write_build_meta(dir: &std::path::Path, anchor: &BuildAnchor) -> std::io::Result<()> {
+    let meta_path = dir.join("pgtantivy_meta.json");
+    let mut v = std::fs::read_to_string(&meta_path)
+        .ok()
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
+        .unwrap_or(serde_json::json!({}));
+    let o = v.as_object_mut().ok_or(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "meta is not a JSON object",
+    ))?;
+    o.insert("built_lsn".into(), serde_json::json!(anchor.built_lsn));
+    o.insert("built_at".into(), serde_json::json!(anchor.built_at));
+    o.insert("n_docs".into(), serde_json::json!(anchor.n_docs));
+    let tmp = dir.join(format!(".pgtantivy_meta.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, v.to_string())?;
+    std::fs::rename(&tmp, &meta_path)?;
+    Ok(())
+}
+
+/// Parse the build anchor from a sidecar's meta (absent keys → None).
+pub fn read_build_meta(dir: &std::path::Path) -> Option<BuildAnchor> {
+    let m = std::fs::read_to_string(dir.join("pgtantivy_meta.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&m).ok()?;
+    let lsn = v["built_lsn"].as_u64()?;
+    let at = v["built_at"].as_i64()?;
+    let nd = v["n_docs"].as_u64().unwrap_or(0);
+    Some(BuildAnchor {
+        built_lsn: lsn,
+        built_at: at,
+        n_docs: nd,
+    })
+}
+
+/// Compare the anchor against the live WAL position.
+#[derive(Clone, Debug)]
+pub struct DriftReport {
+    pub drifted: bool,
+    pub anchor: Option<BuildAnchor>,
+    pub current_lsn: u64,
+    pub current_at: i64,
+}
+
+pub fn check_drift(dir: &std::path::Path) -> DriftReport {
+    let cur_lsn = crate::current_insertion_lsn();
+    let anchor = read_build_meta(dir);
+    let drifted = anchor
+        .as_ref()
+        .map(|a| cur_lsn > a.built_lsn)
+        .unwrap_or(false);
+    DriftReport {
+        drifted,
+        anchor,
+        current_lsn: cur_lsn,
+        current_at: now_millis(),
+    }
+}
+
+fn fmt_lsn(lsn: u64) -> String {
+    let (hi, lo) = ((lsn >> 32) as u32, (lsn & 0xFFFF_FFFF) as u32);
+    format!("{hi:X}/{lo:08X}")
+}
+
+/// After an incremental write (add/remove/trigger flush) the index is fresh
+/// again — push the anchor forward so a later load doesn't report the index
+/// it just wrote as stale. Best-effort: a meta write failure is not an error
+/// (the index is still correct, only the staleness signal is stale).
+fn refresh_anchor(idx: &PgIndex, name: &str) {
+    let Some(path) = idx.path.as_deref() else {
+        return;
+    };
+    let dir = std::path::Path::new(path);
+    let anchor = BuildAnchor {
+        built_lsn: crate::current_insertion_lsn(),
+        built_at: now_millis(),
+        n_docs: idx.reader.searcher().num_docs(),
+    };
+    if let Err(e) = write_build_meta(dir, &anchor) {
+        warning!("pgtantivy: refresh anchor for '{name}' failed: {e}");
+    }
+}
+
 fn safe_name(name: &str) -> bool {
     let b = name.as_bytes();
     !b.is_empty()
@@ -285,11 +420,19 @@ fn pgtantivy_create(
         writer.add_document(doc!(id_field => id, body_field => text_nfc.as_str()))?;
     }
     writer.commit()?;
-    // Sidecar: language for load-time tokenizer registration.
-    let _ = std::fs::write(
+    let n_docs = reader_docs(&index);
+    // Sidecar: language for load-time tokenizer registration, plus the build
+    // anchor for drift detection (write_build_meta merges onto the base).
+    std::fs::write(
         dir_path.join("pgtantivy_meta.json"),
         serde_json::json!({"lang": lang}).to_string(),
-    );
+    )?;
+    let anchor = BuildAnchor {
+        built_lsn: crate::current_insertion_lsn(),
+        built_at: now_millis(),
+        n_docs,
+    };
+    let _ = write_build_meta(&dir_path, &anchor);
     let reader = index.reader()?;
     registry().lock()?.insert(
         name.clone(),
@@ -310,9 +453,7 @@ fn pgtantivy_create(
 
 /// Open a persistent index from disk into the registry (after a restart).
 #[pg_extern]
-fn pgtantivy_load(
-    name: String,
-) -> Result<String, Box<dyn std::error::Error>> {
+fn pgtantivy_load(name: String) -> Result<String, Box<dyn std::error::Error>> {
     if !safe_name(&name) {
         return Err("pgtantivy: name must be [A-Za-z_][A-Za-z0-9_-]*, <=128 chars".into());
     }
@@ -353,22 +494,88 @@ fn pgtantivy_load(
             path: Some(dir_path.to_string_lossy().into_owned()),
         }),
     );
+    // Drift check: if the WAL has advanced since the index was last built,
+    // the snapshot may be stale — warn (not error) so callers can decide.
+    let drift = check_drift(&dir_path);
+    if drift.drifted {
+        if let Some(a) = &drift.anchor {
+            warning!(
+                "pgtantivy: index '{}' may be STALE — built at LSN {}, now at {}; \
+                 run pgtantivy_reindex('{name}') to refresh",
+                name,
+                fmt_lsn(a.built_lsn),
+                fmt_lsn(drift.current_lsn),
+            );
+        }
+    }
     Ok(format!(
         "pgtantivy: index '{}' loaded ({} docs, lang={})",
         name, num_docs, lang
     ))
 }
 
+/// Drift check for a named sidecar: true if the WAL has advanced since the
+/// index was last built/refreshed (its snapshot may be stale).
+///
+/// Caveat (see the anchor docs at the top of this file): the anchor LSN is
+/// global to the cluster — DML on unrelated tables also advances it. Use
+/// this as a staleness *signal* in `WHERE`/monitoring; refresh with
+/// `REINDEX INDEX` (AM) or `pgtantivy_create` again (function API) when in
+/// doubt, then the anchor moves forward on the next build/write.
+#[pg_extern]
+fn pgtantivy_drift_check(name: String) -> Result<bool, Box<dyn std::error::Error>> {
+    if !safe_name(&name) {
+        return Err("pgtantivy: name must be [A-Za-z_][A-Za-z0-9_-]*, <=128 chars".into());
+    }
+    let dir_path = std::path::Path::new(&index_root()).join(&name);
+    if !dir_path.exists() {
+        return Err(format!("pgtantivy: no index '{name}' on disk").into());
+    }
+    Ok(check_drift(&dir_path).drifted)
+}
+
+/// Manually push the build anchor forward (the index is considered fresh at
+/// this moment). Use after an out-of-band sync — e.g. an ETL that refreshed
+/// the heap + sidecar outside this extension's write paths — so subsequent
+/// loads/drift checks start from now.
+#[pg_extern]
+fn pgtantivy_touch(name: String) -> Result<String, Box<dyn std::error::Error>> {
+    if !safe_name(&name) {
+        return Err("pgtantivy: name must be [A-Za-z_][A-Za-z0-9_-]*, <=128 chars".into());
+    }
+    let dir_path = std::path::Path::new(&index_root()).join(&name);
+    if !dir_path.exists() {
+        return Err(format!("pgtantivy: no index '{name}' on disk").into());
+    }
+    let n_docs = registry()
+        .lock()
+        .ok()
+        .and_then(|r| r.get(&name).cloned())
+        .map(|i| i.reader.searcher().num_docs())
+        .unwrap_or(0);
+    let anchor = BuildAnchor {
+        built_lsn: crate::current_insertion_lsn(),
+        built_at: now_millis(),
+        n_docs,
+    };
+    write_build_meta(&dir_path, &anchor)
+        .map_err(|e| format!("pgtantivy: touch '{name}' failed: {e}"))?;
+    Ok(format!(
+        "pgtantivy: anchor for '{name}' refreshed to {}",
+        fmt_lsn(anchor.built_lsn)
+    ))
+}
+
 /// Incrementally append documents to an existing (loaded) index.
 #[pg_extern]
-fn pgtantivy_add(
-    name: String,
-    rows_json: String,
-) -> Result<String, Box<dyn std::error::Error>> {
+fn pgtantivy_add(name: String, rows_json: String) -> Result<String, Box<dyn std::error::Error>> {
     let idx = lookup(&name)?;
     let rows: Vec<serde_json::Value> = serde_json::from_str(&rows_json)?;
     if rows.is_empty() {
-        return Ok(format!("pgtantivy: add to '{}' — nothing to do (0 rows)", name));
+        return Ok(format!(
+            "pgtantivy: add to '{}' — nothing to do (0 rows)",
+            name
+        ));
     }
     let body_field = idx.body;
     let id_field = idx.id;
@@ -395,21 +602,25 @@ fn pgtantivy_add(
     writer.commit()?;
     drop(writer);
     idx.reader.reload()?;
+    refresh_anchor(&*idx, &name);
     maybe_auto_merge(&idx, &name);
-    Ok(format!("pgtantivy: {} doc(s) added to '{}' (upsert by id)", n, name))
+    Ok(format!(
+        "pgtantivy: {} doc(s) added to '{}' (upsert by id)",
+        n, name
+    ))
 }
 
 /// Remove documents from an existing (loaded) index by id.
 #[pg_extern]
-fn pgtantivy_remove(
-    name: String,
-    ids: Array<i64>,
-) -> Result<String, Box<dyn std::error::Error>> {
+fn pgtantivy_remove(name: String, ids: Array<i64>) -> Result<String, Box<dyn std::error::Error>> {
     let idx = lookup(&name)?;
     let id_field = idx.id;
     let ids: Vec<i64> = ids.iter().flatten().collect();
     if ids.is_empty() {
-        return Ok(format!("pgtantivy: remove from '{}' — nothing to do (0 ids)", name));
+        return Ok(format!(
+            "pgtantivy: remove from '{}' — nothing to do (0 ids)",
+            name
+        ));
     }
     let mut writer = idx
         .index
@@ -422,6 +633,7 @@ fn pgtantivy_remove(
     writer.commit()?;
     drop(writer);
     idx.reader.reload()?;
+    refresh_anchor(&*idx, &name);
     Ok(format!("pgtantivy: {} id(s) removed from '{}'", n, name))
 }
 
@@ -432,8 +644,15 @@ fn pgtantivy_remove(
 // pending ops to their indexes; ABORT drops the buffer without touching disk.
 
 enum PendingOp {
-    Upsert { index: String, id: i64, text: String },
-    Delete { index: String, id: i64 },
+    Upsert {
+        index: String,
+        id: i64,
+        text: String,
+    },
+    Delete {
+        index: String,
+        id: i64,
+    },
 }
 
 fn pending_ops() -> &'static Mutex<Vec<PendingOp>> {
@@ -467,7 +686,10 @@ fn flush_pending() {
         let idx = match registry().lock().ok().and_then(|r| r.get(&name).cloned()) {
             Some(i) => i,
             None => {
-                warning!("pgtantivy sync: index '{name}' not loaded; {} op(s) skipped", group.len());
+                warning!(
+                    "pgtantivy sync: index '{name}' not loaded; {} op(s) skipped",
+                    group.len()
+                );
                 continue;
             }
         };
@@ -484,8 +706,7 @@ fn flush_pending() {
         for op in &group {
             match op {
                 PendingOp::Upsert { id, text, .. } => {
-                    let _ = writer
-                        .delete_term(tantivy::Term::from_field_i64(idx.id, *id));
+                    let _ = writer.delete_term(tantivy::Term::from_field_i64(idx.id, *id));
                     let text_nfc = nfc(text);
                     let _ = writer.add_document(doc!(
                         idx.id => *id,
@@ -503,6 +724,7 @@ fn flush_pending() {
         }
         drop(writer);
         let _ = idx.reader.reload();
+        refresh_anchor(&idx, &name);
         maybe_auto_merge(&idx, &name);
     }
 }
@@ -512,9 +734,7 @@ fn flush_pending() {
 /// accumulates small segments + tombstones. This rewrites it as a single
 /// segment: reclaimed disk, faster queries.
 #[pg_extern]
-fn pgtantivy_merge(
-    name: String,
-) -> Result<String, Box<dyn std::error::Error>> {
+fn pgtantivy_merge(name: String) -> Result<String, Box<dyn std::error::Error>> {
     let idx = lookup(&name)?;
     let before = idx.index.searchable_segment_metas()?.len();
     if before <= 1 {
@@ -523,7 +743,9 @@ fn pgtantivy_merge(
         ));
     }
     merge_all(&idx)?;
-    Ok(format!("pgtantivy: '{name}' merged {before} segment(s) into 1"))
+    Ok(format!(
+        "pgtantivy: '{name}' merged {before} segment(s) into 1"
+    ))
 }
 
 /// Drop all buffered ops (xact ABORT).
@@ -712,4 +934,3 @@ pub mod test {
         assert_eq!("0.1.0", env!("CARGO_PKG_VERSION"));
     }
 }
-
