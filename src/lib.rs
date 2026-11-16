@@ -17,7 +17,7 @@ use tantivy::snippet::SnippetGenerator;
 use tantivy::tokenizer::{
     LowerCaser, SimpleTokenizer, TextAnalyzer, Token, TokenStream, Tokenizer,
 };
-use tantivy::{doc, Index, IndexReader};
+use tantivy::{doc, Index, IndexReader, ReloadPolicy};
 
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use unicode_normalization::UnicodeNormalization;
@@ -754,6 +754,73 @@ fn pgtantivy_import_from_s3(
     Ok(format!(
         "pgtantivy: imported '{as_name}' from s3://{bucket}/{prefix}/{bundle_name} (opstamp {}, {} docs, writer {})",
         meta.opstamp, n_docs, meta.writer_id
+    ))
+}
+
+/// Load an index directly from an S3 bundle via the range-read `S3Directory`
+/// (approach 2) — NO whole-bundle download to local disk. The index is
+/// registered under `as_name` and searchable with `pgtantivy_search` just like
+/// a local/index-loaded one; subsequent reads range-GET only what the query
+/// touches and cache splits per-process (warm queries pull ~0 bytes).
+///
+/// `bundle_name` is the published name, e.g. `'snap-3.bundle'`; the objects are
+/// addressed under `<prefix>/<bundle_name>/`. Use `pgtantivy_list_s3` to find
+/// the current `bundle_name` for a logical `name`.
+#[pg_extern]
+fn pgtantivy_load_s3(
+    endpoint: String,
+    bucket: String,
+    region: String,
+    access_key: String,
+    secret: String,
+    prefix: String,
+    bundle_name: String,
+    as_name: String,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if !safe_name(&as_name) {
+        return Err("pgtantivy: name must be [A-Za-z_][A-Za-z0-9_-]*, <=128 chars".into());
+    }
+    if registry().lock()?.contains_key(&as_name) {
+        return Ok(format!(
+            "pgtantivy: index '{as_name}' already loaded (S3 load is idempotent)"
+        ));
+    }
+    if !bundle_name.trim().ends_with(".bundle") {
+        return Err("pgtantivy: bundle_name must be '<name>-<opstamp>.bundle'".into());
+    }
+    let bundle_key_prefix = format!("{}/{}", prefix.trim_end_matches('/'), bundle_name);
+    let (index, lang) =
+        s3::open_s3_index(&endpoint, &bucket, &region, &access_key, &secret, &bundle_key_prefix)?;
+    index
+        .tokenizers()
+        .register(JIEBA_TOKENIZER, analyzer(&lang));
+    let schema = index.schema();
+    let body = schema
+        .get_field("body")
+        .map_err(|_| "pgtantivy: index lacks body field")?;
+    let id = schema
+        .get_field("id")
+        .map_err(|_| "pgtantivy: index lacks id field")?;
+    // Read-only S3 directory: no watch. Manual reload avoids the default
+    // OnCommitWithDelay policy (which would call watch() and fail).
+    let reader = index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::Manual)
+        .try_into()?;
+    let num_docs = reader.searcher().num_docs();
+    registry().lock()?.insert(
+        as_name.clone(),
+        Arc::new(PgIndex {
+            index,
+            reader,
+            body,
+            id,
+            path: Some(format!("s3://{bucket}/{bundle_key_prefix}")),
+        }),
+    );
+    Ok(format!(
+        "pgtantivy: loaded '{as_name}' from s3://{bucket}/{bundle_key_prefix} (range-read, {} docs, lang={})",
+        num_docs, lang
     ))
 }
 

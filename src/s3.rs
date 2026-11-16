@@ -17,14 +17,21 @@
 //! Async is bridged to the synchronous PG backend with a lazily-created
 //! single-thread tokio runtime (`block_on`), one worker, no thread-pool spawn
 //! from inside a postgres backend.
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bytes::Bytes;
 use futures::StreamExt;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path as OPath;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, PutPayload};
+
+use tantivy::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
+use tantivy::directory::{
+    Directory, DirectoryLock, FileHandle, Lock, OwnedBytes, WatchCallback, WatchHandle, WritePtr,
+};
+use tantivy::{HasLen, Index, TantivyError};
 
 /// Lazily constructed single-thread runtime (first S3 call builds it).
 static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -317,4 +324,187 @@ fn safe_join(base: &Path, rel: &str) -> Result<PathBuf, Box<dyn std::error::Erro
         return Err("path traversal in bundle rel path".into());
     }
     Ok(base.join(rel))
+}
+
+// ── Approach 2: range-read S3Directory (shared-index read optimization) ────────
+//
+// The S3 `Directory` for tantivy reads index files directly from the object
+// store via range GET (no full-bundle download to local disk). tantivy issues
+// `read_bytes(range)` per chunk (its `stream_file_chunks` uses 1 MB blocks);
+// each range is one S3 `get_range`. A per-process split cache turns repeat
+// reads of the same file into local cache hits (warm queries pull ~0 bytes).
+//
+// This is the production landing of the feasibility spike in
+// `alitrack/pgtantivy-s3dir-spike` (same tantivy 0.24 + object_store 0.14, code
+// moved in). Known follow-ups (not blocking the base feature): file-length
+// cache is per-open (a head GET per file on first touch) and there is no
+// query pre-warm / footer cache yet.
+
+#[derive(Clone, Debug)]
+struct S3FileHandle {
+    s3: Arc<AmazonS3>,
+    key: String,
+    len: u64,
+    cache: Arc<Mutex<HashMap<String, Bytes>>>,
+}
+
+impl HasLen for S3FileHandle {
+    fn len(&self) -> usize {
+        self.len as usize
+    }
+}
+
+impl FileHandle for S3FileHandle {
+    fn read_bytes(&self, range: std::ops::Range<usize>) -> std::io::Result<OwnedBytes> {
+        let (start, end) = (range.start as u64, range.end as u64);
+        // split cache: if the whole file is cached, slice locally (0 S3 bytes)
+        {
+            let c = self.cache.lock().unwrap();
+            if let Some(b) = c.get(&self.key) {
+                let s = start as usize;
+                let e = (end as usize).min(b.len());
+                if e >= s {
+                    return Ok(OwnedBytes::new(b[s..e].to_vec()));
+                }
+            }
+        }
+        // else: one S3 range GET (the whole point of approach 2)
+        let s3 = self.s3.clone();
+        let k = self.key.clone();
+        let b: Bytes = rt()
+            .block_on(async move { s3.get_range(&OPath::from(k.as_str()), start..end).await })
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        if start == 0 && end >= self.len {
+            self.cache.lock().unwrap().insert(self.key.clone(), b.clone());
+        }
+        Ok(OwnedBytes::new(b.to_vec()))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct S3Directory {
+    s3: Arc<AmazonS3>,
+    prefix: String,
+    cache: Arc<Mutex<HashMap<String, Bytes>>>,
+}
+
+impl S3Directory {
+    fn new(s3: Arc<AmazonS3>, prefix: &str) -> Self {
+        Self {
+            s3,
+            prefix: prefix.trim_end_matches('/').to_string(),
+            cache: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl Directory for S3Directory {
+    fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
+        let rel = path.to_str().unwrap_or("").trim_start_matches('/').to_string();
+        if rel.is_empty() {
+            return Err(OpenReadError::FileDoesNotExist(PathBuf::from("empty")));
+        }
+        let key = format!("{}/{}", self.prefix, rel);
+        let s3 = self.s3.clone();
+        let k = key.clone();
+        let meta = rt()
+            .block_on(async move { s3.head(&OPath::from(k.as_str())).await })
+            .map_err(|e| OpenReadError::IoError {
+                io_error: Arc::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("no object {key}: {e}"),
+                )),
+                filepath: Path::new(&key).to_path_buf(),
+            })?;
+        Ok(Arc::new(S3FileHandle {
+            s3: self.s3.clone(),
+            key,
+            len: meta.size,
+            cache: self.cache.clone(),
+        }))
+    }
+    fn delete(&self, _path: &Path) -> Result<(), DeleteError> {
+        Err(DeleteError::IoError {
+            io_error: Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "S3Directory is read-only")),
+            filepath: Path::new("ro").to_path_buf(),
+        })
+    }
+    fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
+        let rel = path.to_str().unwrap_or("").trim_start_matches('/').to_string();
+        if rel.is_empty() {
+            return Ok(true);
+        }
+        let key = format!("{}/{}", self.prefix, rel);
+        let s3 = self.s3.clone();
+        let k = key.clone();
+        let r = rt().block_on(async move { s3.head(&OPath::from(k.as_str())).await });
+        Ok(r.is_ok())
+    }
+    fn open_write(&self, _path: &Path) -> Result<WritePtr, OpenWriteError> {
+        Err(OpenWriteError::IoError {
+            io_error: Arc::new(std::io::Error::new(std::io::ErrorKind::Unsupported, "S3Directory is read-only")),
+            filepath: Path::new("ro").to_path_buf(),
+        })
+    }
+    fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
+        let fh = self.get_file_handle(path)?;
+        let len = fh.len();
+        let b = fh.read_bytes(0..len).map_err(|e| OpenReadError::IoError {
+            io_error: Arc::new(e),
+            filepath: Path::new("atomic_read").to_path_buf(),
+        })?;
+        Ok(b[..].to_vec())
+    }
+    fn atomic_write(&self, _path: &Path, _data: &[u8]) -> std::io::Result<()> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "S3Directory is read-only"))
+    }
+    fn sync_directory(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn acquire_lock(&self, _lock: &Lock) -> Result<DirectoryLock, LockError> {
+        Ok(DirectoryLock::from(Box::new(())))
+    }
+    fn watch(&self, _cb: WatchCallback) -> tantivy::Result<WatchHandle> {
+        Err(TantivyError::IoError(Arc::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "S3Directory: watch not supported (read-only replica)",
+        ))))
+    }
+}
+
+/// Open an S3 bundle with the range-read `S3Directory` (approach 2) — no full
+/// download. Returns the opened `Index` and the index's recorded `lang` (from
+/// the bundle's `pgtantivy_meta.json`) so the caller can register the matching
+/// tokenizer.
+pub fn open_s3_index(
+    endpoint: &str,
+    bucket: &str,
+    region: &str,
+    access_key: &str,
+    secret: &str,
+    bundle_key_prefix: &str,
+) -> Result<(Index, String), Box<dyn std::error::Error>> {
+    let store = Arc::new(build_store(endpoint, bucket, region, access_key, secret)?);
+    // Read the lang sidecar (small object) so search registers the right tokenizer.
+    let lang = {
+        let meta_key = format!("{}/pgtantivy_meta.json", bundle_key_prefix.trim_end_matches('/'));
+        let s3 = store.clone();
+        let k = meta_key.clone();
+        let r = rt().block_on(async move {
+            let p = OPath::from(k.as_str());
+            let g = s3.get(&p).await?;
+            g.bytes().await
+        });
+        r.ok()
+            .and_then(|b| {
+                let s = String::from_utf8_lossy(&b).to_string();
+                serde_json::from_str::<serde_json::Value>(&s)
+                    .ok()
+                    .and_then(|v| v["lang"].as_str().map(std::string::ToString::to_string))
+            })
+            .unwrap_or_else(|| "chinese".to_string())
+    };
+    let dir = S3Directory::new(store, bundle_key_prefix);
+    let index = Index::open(Box::new(dir) as Box<dyn Directory>)?;
+    Ok((index, lang))
 }
