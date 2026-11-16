@@ -340,12 +340,80 @@ fn safe_join(base: &Path, rel: &str) -> Result<PathBuf, Box<dyn std::error::Erro
 // cache is per-open (a head GET per file on first touch) and there is no
 // query pre-warm / footer cache yet.
 
+/// A whole-file split cache bounded by a byte budget, evicting least-recently
+/// used entries (manual LRU over a `HashMap` + recency ordering, no external
+/// crate). `budget == 0` means unbounded. Shared across all `S3FileHandle`s
+/// of one opened bundle so warm files are reused across queries/backends.
+#[derive(Debug)]
+struct LruFiles {
+    entries: HashMap<String, Bytes>,
+    /// LRU order, least-recently-used first.
+    order: Vec<String>,
+    used: usize,
+    budget: usize,
+}
+
+impl LruFiles {
+    fn new(budget: usize) -> Self {
+        Self { entries: HashMap::new(), order: Vec::new(), used: 0, budget }
+    }
+
+    fn get(&self, key: &str) -> Option<&Bytes> {
+        self.entries.get(key)
+    }
+
+    fn used_bytes(&self) -> usize {
+        self.used
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Insert a whole file; evict LRU entries until under budget. A single
+    /// entry larger than the whole budget is not cached (it would never fit).
+    fn put(&mut self, key: &str, bytes: Bytes) {
+        let size = bytes.len();
+        if self.budget != 0 && size > self.budget {
+            return;
+        }
+        if let Some(old) = self.entries.get(key) {
+            self.used = self.used.saturating_sub(old.len());
+            if let Some(pos) = self.order.iter().position(|k| k == key) {
+                self.order.remove(pos);
+            }
+        }
+        self.entries.insert(key.to_string(), bytes);
+        self.order.push(key.to_string());
+        self.used += size;
+        if self.budget != 0 {
+            while self.used > self.budget && !self.order.is_empty() {
+                if let Some(victim) = self.order.first().cloned() {
+                    if let Some(evicted) = self.entries.remove(&victim) {
+                        self.used = self.used.saturating_sub(evicted.len());
+                    }
+                    self.order.remove(0);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn touch(&mut self, key: &str) {
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            let k = self.order.remove(pos);
+            self.order.push(k);
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct S3FileHandle {
     s3: Arc<AmazonS3>,
     key: String,
     len: u64,
-    cache: Arc<Mutex<HashMap<String, Bytes>>>,
+    cache: Arc<Mutex<LruFiles>>,
 }
 
 impl HasLen for S3FileHandle {
@@ -359,12 +427,14 @@ impl FileHandle for S3FileHandle {
         let (start, end) = (range.start as u64, range.end as u64);
         // split cache: if the whole file is cached, slice locally (0 S3 bytes)
         {
-            let c = self.cache.lock().unwrap();
+            let mut c = self.cache.lock().unwrap();
             if let Some(b) = c.get(&self.key) {
                 let s = start as usize;
                 let e = (end as usize).min(b.len());
                 if e >= s {
-                    return Ok(OwnedBytes::new(b[s..e].to_vec()));
+                    let out = b[s..e].to_vec();
+                    c.touch(&self.key);
+                    return Ok(OwnedBytes::new(out));
                 }
             }
         }
@@ -375,7 +445,8 @@ impl FileHandle for S3FileHandle {
             .block_on(async move { s3.get_range(&OPath::from(k.as_str()), start..end).await })
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         if start == 0 && end >= self.len {
-            self.cache.lock().unwrap().insert(self.key.clone(), b.clone());
+            // Whole file read: cache it (LRU, bounded by the cache budget).
+            self.cache.lock().unwrap().put(&self.key, b.clone());
         }
         Ok(OwnedBytes::new(b.to_vec()))
     }
@@ -385,7 +456,7 @@ impl FileHandle for S3FileHandle {
 struct S3Directory {
     s3: Arc<AmazonS3>,
     prefix: String,
-    cache: Arc<Mutex<HashMap<String, Bytes>>>,
+    cache: Arc<Mutex<LruFiles>>,
     /// Per-file length cache seeded from the bundle `manifest.json` (each
     /// `FileEntry.size`). Lets `get_file_handle`/`exists` avoid a per-file
     /// `head` round-trip on the cold path.
@@ -401,10 +472,19 @@ impl S3Directory {
         Self {
             s3,
             prefix: prefix.trim_end_matches('/').to_string(),
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::new(Mutex::new(LruFiles::new(cache_budget_bytes()))),
             lens,
         }
     }
+}
+
+/// Whole-file split cache budget (bytes) for a loaded S3 bundle.
+/// `PGTANTIVY_S3_CACHE_BYTES` overrides the default 128 MiB; `0` = unbounded.
+fn cache_budget_bytes() -> usize {
+    std::env::var("PGTANTIVY_S3_CACHE_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(128 * 1024 * 1024)
 }
 
 impl Directory for S3Directory {
@@ -540,4 +620,68 @@ pub fn open_s3_index(
     let dir = S3Directory::new(store, bundle_key_prefix, lens);
     let index = Index::open(Box::new(dir) as Box<dyn Directory>)?;
     Ok((index, lang))
+}
+
+#[cfg(test)]
+mod lru_tests {
+    use super::LruFiles;
+
+    fn b(n: usize) -> bytes::Bytes {
+        bytes::Bytes::from(vec![0u8; n])
+    }
+
+    #[test]
+    fn budget_is_respected_and_lru_is_evicted() {
+        let mut c = LruFiles::new(100);
+        c.put("a", b(60));
+        assert_eq!(c.used_bytes(), 60);
+        assert_eq!(c.len(), 1);
+        // adding 60 more exceeds 100 -> evict LRU ("a")
+        c.put("b", b(60));
+        assert_eq!(c.used_bytes(), 60, "one entry evicted");
+        assert_eq!(c.len(), 1);
+        assert!(c.get("a").is_none(), "LRU 'a' evicted");
+        assert!(c.get("b").is_some(), "'b' retained");
+    }
+
+    #[test]
+    fn touch_moves_entry_to_most_recently_used() {
+        let mut c = LruFiles::new(100);
+        c.put("a", b(30));
+        c.put("b", b(30));
+        c.put("c", b(30)); // order LRU->MRU: a,b,c ; used=90
+        c.touch("a"); // now LRU->MRU: b,c,a
+        // adding 30 -> used 120 > 100 -> evict LRU which is now "b" (not "a")
+        c.put("d", b(30));
+        assert!(c.get("b").is_none(), "'b' was LRU after touching 'a'");
+        assert!(c.get("a").is_some(), "touched 'a' survived");
+        assert!(c.get("d").is_some());
+    }
+
+    #[test]
+    fn oversized_single_entry_is_not_cached() {
+        let mut c = LruFiles::new(100);
+        c.put("big", b(200));
+        assert_eq!(c.len(), 0, "entry larger than whole budget is skipped");
+        assert_eq!(c.used_bytes(), 0);
+    }
+
+    #[test]
+    fn zero_budget_means_unbounded() {
+        let mut c = LruFiles::new(0);
+        for i in 0..10 {
+            c.put(&format!("f{i}"), b(50));
+        }
+        assert_eq!(c.len(), 10, "no eviction when budget=0");
+        assert_eq!(c.used_bytes(), 500);
+    }
+
+    #[test]
+    fn reinsert_same_key_replaces_not_doubles() {
+        let mut c = LruFiles::new(100);
+        c.put("a", b(60));
+        c.put("a", b(60)); // same key, same size
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.used_bytes(), 60, "reinsert must not double-count");
+    }
 }

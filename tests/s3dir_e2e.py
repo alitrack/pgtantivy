@@ -57,11 +57,14 @@ def q(sql: str) -> str:
     return lines[-1].strip() if lines else ""
 
 
-def q_lines(sql: str) -> list:
+def q_lines(sql: str, extra_env: dict = None) -> list:
+    env = dict(ENV)
+    if extra_env:
+        env.update(extra_env)
     wrapped = f"LOAD '{SO}'; SET pgtantivy.index_dir='{IDX}'; {sql}"
     r = subprocess.run(["psql", "-tA", "-q", "-v", "ON_ERROR_STOP=1",
                         "-d", DB, "-c", wrapped],
-                       env=ENV, capture_output=True, text=True, timeout=180)
+                       env=env, capture_output=True, text=True, timeout=180)
     if r.returncode != 0:
         raise RuntimeError(f"SQL failed: {sql!r}\n{r.stderr}")
     return [ln for ln in (r.stdout or "").splitlines() if ln.strip()]
@@ -135,6 +138,20 @@ def main() -> int:
     print(f"              alpha after warm = {second} (expect 100)")
     assert "warmed: alpha, beta" in first, f"warm-up note missing: {first!r}"
     assert second == "100", f"alpha after warm got {second!r}"
+
+    # ---- G. bounded split cache: a 1KB budget (smaller than any split file)
+    # forces the LRU to evict everything, yet range-read must stay CORRECT
+    # (just slower, never OOM / never wrong). Proves the memory ceiling holds.
+    tiny = {"PGTANTIVY_S3_CACHE_BYTES": "1024"}
+    lines = q_lines(
+        f"SELECT pgtantivy_load_s3({creds}, {sqlq(bundle)}, {sqlq(as_name)}, NULL); "
+        f"SELECT (SELECT count(*) FROM pgtantivy_search({sqlq(as_name)}, 'alpha', {N})) AS a, "
+        f"(SELECT count(*) FROM pgtantivy_search({sqlq(as_name)}, 'beta', {N})) AS b;",
+        extra_env=tiny,
+    )
+    a, b = lines[1].split("|")
+    print(f"G. tiny budget (1KB): alpha={a.strip()} beta={b.strip()} (expect 100/100 — cache evicts, range-read stays correct)")
+    assert a.strip() == "100" and b.strip() == "100", f"tiny-budget search got {lines[1]!r}"
 
     # cleanup
     shutil.rmtree(IDX, ignore_errors=True)
