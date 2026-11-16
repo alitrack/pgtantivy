@@ -57,25 +57,25 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct FileEntry {
-    rel: String,
-    size: u64,
-    fnv: u64,
+pub(crate) struct FileEntry {
+    pub(crate) rel: String,
+    pub(crate) size: u64,
+    pub(crate) fnv: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Manifest {
-    format: String,
-    format_version: u32,
-    name: String,
-    opstamp: u64,
-    written_at: i64,
-    writer_id: String,
-    n_docs: u64,
-    lang: String,
+pub(crate) struct Manifest {
+    pub(crate) format: String,
+    pub(crate) format_version: u32,
+    pub(crate) name: String,
+    pub(crate) opstamp: u64,
+    pub(crate) written_at: i64,
+    pub(crate) writer_id: String,
+    pub(crate) n_docs: u64,
+    pub(crate) lang: String,
     /// Build-time WAL anchor carried from the source sidecar (staleness signal).
-    anchor: Option<BuildAnchor>,
-    files: Vec<FileEntry>,
+    pub(crate) anchor: Option<BuildAnchor>,
+    pub(crate) files: Vec<FileEntry>,
 }
 
 const FORMAT: &str = "pgtantivy-index-bundle";

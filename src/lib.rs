@@ -25,6 +25,7 @@ pg_module_magic!();
 
 pub mod am;
 pub mod hybrid;
+pub mod s3;
 pub mod snapshot;
 
 // GUC pgtantivy.index_dir: where persistent indexes live. Empty (the
@@ -671,6 +672,111 @@ fn pgtantivy_import_index(bundle: String, as_name: String) -> Result<String, Box
 #[pg_extern]
 fn pgtantivy_bundle_info(bundle: String) -> Result<String, Box<dyn std::error::Error>> {
     snapshot::bundle_info(&bundle)
+}
+
+/// Publish an on-disk index to S3 as an immutable, versioned bundle
+/// (research #2026111601 "共享索引" approach 1 — the cross-node transfer leg).
+/// Builds the local bundle (same as `pgtantivy_export_index`: manifest-last,
+/// FNV checksums, opstamp, dual-writer fence, local retention) then uploads it
+/// object-by-object to S3, with the `manifest.json` uploaded LAST (the
+/// "published" marker — a reader listing versions never sees a half-written
+/// bundle). Applies the S3-side retention policy for `keep`.
+/// `endpoint`/`region`/`access_key`/`secret` are per-call (MinIO-friendly, no
+/// PG env dependency); `prefix` is the object-key namespace (e.g. "fti").
+#[pg_extern]
+fn pgtantivy_export_to_s3(
+    name: String,
+    endpoint: String,
+    bucket: String,
+    region: String,
+    access_key: String,
+    secret: String,
+    prefix: String,
+    writer_id: Option<String>,
+    keep: Option<i64>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if !safe_name(&name) {
+        return Err("pgtantivy: name must be [A-Za-z_][A-Za-z0-9_-]*, <=128 chars".into());
+    }
+    let dir_path = std::path::Path::new(&index_root()).join(&name);
+    if !dir_path.exists() {
+        return Err(format!("pgtantivy: no index '{name}' on disk").into());
+    }
+    let local_dest = std::env::temp_dir().join("pgt_s3_local").to_string_lossy().into_owned();
+    let keep_u = keep.unwrap_or(0).max(0) as u64;
+    let (local_bundle, _opstamp, n_files) =
+        snapshot::export_bundle(&name, &dir_path, &local_dest, writer_id, keep_u)?;
+    let op = s3::upload_bundle(
+        &endpoint, &bucket, &region, &access_key, &secret, &prefix,
+        &local_bundle, &name, keep_u,
+    )?;
+    let _ = std::fs::remove_dir_all(&local_dest);
+    Ok(format!(
+        "pgtantivy: published '{name}' opstamp {op} ({n_files} files) to s3://{bucket}/{prefix}/{name}-{} (region {region})",
+        op
+    ))
+}
+
+/// Download a published S3 bundle and register it as index `as_name` on this
+/// instance. Re-verify every file's size + FNV checksum before extracting
+/// (a corrupted/tampered object is rejected), extract to
+/// `<index_root>/<as_name>/`, confirm the doc count, and register it for
+/// immediate search. The replica keeps its build-time drift anchor.
+#[pg_extern]
+fn pgtantivy_import_from_s3(
+    endpoint: String,
+    bucket: String,
+    region: String,
+    access_key: String,
+    secret: String,
+    prefix: String,
+    bundle_name: String,
+    as_name: String,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if !safe_name(&as_name) {
+        return Err("pgtantivy: import name must be [A-Za-z_][A-Za-z0-9_-]*, <=128 chars".into());
+    }
+    if !bundle_name.trim().ends_with(".bundle") {
+        return Err("pgtantivy: bundle_name must be '<name>-<opstamp>.bundle'".into());
+    }
+    let target = std::path::Path::new(&index_root()).join(&as_name);
+    if target.exists() {
+        return Err(format!(
+            "pgtantivy: index '{as_name}' already exists; remove it first"
+        )
+        .into());
+    }
+    let meta = s3::download_bundle(
+        &endpoint, &bucket, &region, &access_key, &secret, &prefix,
+        &bundle_name, &target,
+    )?;
+    let n_docs = register_index_at(&target, &as_name)?;
+    Ok(format!(
+        "pgtantivy: imported '{as_name}' from s3://{bucket}/{prefix}/{bundle_name} (opstamp {}, {} docs, writer {})",
+        meta.opstamp, n_docs, meta.writer_id
+    ))
+}
+
+/// List the published S3 bundle versions for `name` (those with a manifest),
+/// newest first: opstamp, bundle name, doc count.
+#[pg_extern]
+fn pgtantivy_list_s3(
+    endpoint: String,
+    bucket: String,
+    region: String,
+    access_key: String,
+    secret: String,
+    prefix: String,
+    name: String,
+) -> Result<TableIterator<'static, (name!(opstamp, i64), name!(bundle, String), name!(n_docs, i64))>, Box<dyn std::error::Error>> {
+    let rows = s3::list_versions(
+        &endpoint, &bucket, &region, &access_key, &secret, &prefix, &name,
+    )?;
+    let rows: Vec<(i64, String, i64)> = rows
+        .into_iter()
+        .map(|(op, b, d)| (op as i64, b, d as i64))
+        .collect();
+    Ok(TableIterator::new(rows))
 }
 
 /// Incrementally append documents to an existing (loaded) index.
