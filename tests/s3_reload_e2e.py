@@ -57,6 +57,9 @@ CREATE OR REPLACE FUNCTION "pgtantivy_load_s3"(
 CREATE OR REPLACE FUNCTION "pgtantivy_reload_s3"(
   "name" TEXT, "to_bundle" TEXT
 ) RETURNS TEXT LANGUAGE c AS '/tmp/pgext/lib/pgtantivy.so', 'pgtantivy_reload_s3_wrapper';
+CREATE OR REPLACE FUNCTION "pgtantivy_s3_status"(
+  "name" TEXT
+) RETURNS TEXT LANGUAGE c AS '/tmp/pgext/lib/pgtantivy.so', 'pgtantivy_s3_status_wrapper';
 """
 
 
@@ -139,29 +142,37 @@ def main() -> int:
     assert op2 in ops and op1 in ops, f"both versions must be listed: {ops}"
     assert ops[0] == op2, f"newest first: {ops}"
 
-    # ---- F/G/H: load v1 -> upgrade -> noop -> rollback, ONE backend -------
+    # ---- F/G/H: load v1 -> (status) -> upgrade -> (status) -> noop -> rollback -> (status), ONE backend -------
     # (S3 replica is per-backend registry; all of these must share a backend
     # to see the 'rep' entry. Same psql invocation = one backend.)
     parts = q_lines(
         f"SELECT pgtantivy_load_s3({creds}, {sqlq(bundle1)}, {sqlq(as_name)}, NULL); "
+        f"SELECT pgtantivy_s3_status({sqlq(as_name)}); "
         f"SELECT pgtantivy_reload_s3({sqlq(as_name)}, NULL); "
+        f"SELECT pgtantivy_s3_status({sqlq(as_name)}); "
         f"SELECT (SELECT count(*) FROM pgtantivy_search({sqlq(as_name)}, 'gamma', {2*N})) AS g, "
         f"       (SELECT count(*) FROM pgtantivy_search({sqlq(as_name)}, 'alpha', {2*N})) AS a; "
         f"SELECT pgtantivy_reload_s3({sqlq(as_name)}, NULL); "
         f"SELECT pgtantivy_reload_s3({sqlq(as_name)}, {sqlq(bundle1)}); "
+        f"SELECT pgtantivy_s3_status({sqlq(as_name)}); "
         f"SELECT (SELECT count(*) FROM pgtantivy_search({sqlq(as_name)}, 'gamma', {2*N})) AS g, "
         f"       (SELECT count(*) FROM pgtantivy_search({sqlq(as_name)}, 'alpha', {2*N})) AS a;"
     )
-    # parts: 0=load 1=reload-NEW 2=counts(up) 3=noop 4=rollback 5=counts(down)
-    assert len(parts) == 6, f"expected 6 result rows, got {len(parts)}: {parts!r}"
-    load_msg, up_msg, up_counts, noop_msg, rb_msg, down_counts = parts
+    # parts: 0=load 1=status(LAG) 2=reloadNEW 3=status(UP-TO-DATE)
+    #        4=counts(up) 5=noop 6=rollback 7=status(LAG) 8=counts(down)
+    assert len(parts) == 9, f"expected 9 result rows, got {len(parts)}: {parts!r}"
+    (load_msg, st_lag, up_msg, st_up,
+     up_counts, noop_msg, rb_msg, st_lag2, down_counts) = parts
     up_counts = up_counts.split("|")
     down_counts = down_counts.split("|")
     print(f"F. load v1   : {load_msg.strip()}")
+    print(f"   status v1 : {st_lag.strip()}")
     print(f"   reload NEW: {up_msg.strip()}")
+    print(f"   status v2 : {st_up.strip()}")
     print(f"   up counts : gamma={up_counts[0].strip()} alpha={up_counts[1].strip()} (expect 100/50)")
     print(f"G. noop      : {noop_msg.strip()}")
     print(f"H. rollback  : {rb_msg.strip()}")
+    print(f"   status v1b: {st_lag2.strip()}")
     print(f"   down counts: gamma={down_counts[0].strip()} alpha={down_counts[1].strip()} (expect 0/50)")
     assert f"reloaded -> {bundle2}" in up_msg, f"upgrade target: {up_msg!r}"
     assert up_counts[0].strip() == "100", f"v2 gamma got {up_counts[0]!r}"
@@ -170,6 +181,12 @@ def main() -> int:
     assert f"reloaded -> {bundle1}" in rb_msg, f"rollback target: {rb_msg!r}"
     assert down_counts[0].strip() == "0", f"v1 has no gamma, got {down_counts[0]!r}"
     assert down_counts[1].strip() == "50", f"v1 alpha got {down_counts[1]!r}"
+    # status transitions across the two states (the decisive proof of the
+    # lag-health check): behind after loading v1, caught-up after upgrade,
+    # behind again after rollback.
+    assert "LAGGING" in st_lag, f"loading v1 should report LAGGING, got {st_lag!r}"
+    assert "UP-TO-DATE" in st_up, f"after upgrade should be UP-TO-DATE, got {st_up!r}"
+    assert "LAGGING" in st_lag2, f"after rollback should be LAGGING again, got {st_lag2!r}"
 
     # ---- I. bad to_bundle -> clear error ---------------------------------
     # (fresh backend: load first so 'rep' exists, then the bad-bundle guard

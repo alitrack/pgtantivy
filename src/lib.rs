@@ -998,6 +998,64 @@ fn pgtantivy_list_s3(
     Ok(TableIterator::new(rows))
 }
 
+/// Replication-lag health for an S3-loaded replica: is it serving the newest
+/// published version of its source, or is it behind? Read-only, reuses the S3
+/// origin stored at load — no credentials re-supplied. Returns a single-line
+/// status string: `up-to-date` / `lagging (serving op X, source op Y)` /
+/// `source-unknown` (no published versions found). Pair with
+/// `pgtantivy_reload_s3(name, NULL)` to catch up.
+#[pg_extern]
+fn pgtantivy_s3_status(name: String) -> Result<String, Box<dyn std::error::Error>> {
+    let cred = {
+        let reg = registry().lock()?;
+        let idx = reg
+            .get(&name)
+            .ok_or_else(|| format!("pgtantivy: index '{name}' not loaded in this backend"))?;
+        idx.s3
+            .clone()
+            .ok_or_else(|| format!("pgtantivy: '{name}' is not an S3 replica"))?
+    };
+    // The bundle the replica is currently serving (last path segment, e.g.
+    // "snap-3.bundle"); parse its opstamp.
+    let cur_bundle = registry()
+        .lock()?
+        .get(&name)
+        .and_then(|i| i.path.clone())
+        .map(|p| p.rsplit('/').next().unwrap_or("").to_string())
+        .unwrap_or_default();
+    let cur_op: Option<u64> = cur_bundle
+        .strip_suffix(".bundle")
+        .and_then(|b| b.rsplit_once('-').map(|(_, o)| o.parse::<u64>().ok()))
+        .flatten();
+    // Newest published version of the source.
+    let versions = s3::list_versions(
+        &cred.endpoint, &cred.bucket, &cred.region,
+        &cred.access_key, &cred.secret_key, &cred.prefix, &cred.name,
+    )?;
+    let latest = versions.first().map(|(op, b, _)| (*op, b.clone()));
+    match (cur_op, latest) {
+        (Some(cur), Some((latest_op, _))) if cur == latest_op => {
+            Ok(format!(
+                "pgtantivy_s3_status('{name}'): UP-TO-DATE (serving {cur_bundle})"
+            ))
+        }
+        (Some(cur), Some((latest_op, _))) => Ok(format!(
+            "pgtantivy_s3_status('{name}'): LAGGING (serving op {cur}; source is op {latest_op})"
+        )),
+        (None, Some((latest_op, latest_bundle))) => Ok(format!(
+            "pgtantivy_s3_status('{name}'): LAGGING (serving {cur_bundle} w/o opstamp; source is op {latest_op} / {latest_bundle})"
+        )),
+        (Some(cur), None) => Ok(format!(
+            "pgtantivy_s3_status('{name}'): SOURCE-UNKNOWN (serving op {cur}; no published bundles found for '{}')",
+            cred.name
+        )),
+        (None, None) => Ok(format!(
+            "pgtantivy_s3_status('{name}'): SOURCE-UNKNOWN (no published bundles for '{}'; replica path {cur_bundle})",
+            cred.name
+        )),
+    }
+}
+
 /// Incrementally append documents to an existing (loaded) index.
 #[pg_extern]
 fn pgtantivy_add(name: String, rows_json: String) -> Result<String, Box<dyn std::error::Error>> {
