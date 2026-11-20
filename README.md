@@ -104,13 +104,21 @@ SET pgtantivy.index_dir = '/data/fti';
 
 ## Build & install
 
+Build the `.so` for your target major version (the crate ships a `pg17` and a
+`pg19` feature; the index-AM handler's `IndexAmRoutine` allocation is gated on
+it — PG19 wants a process-lifetime static, PG17 wants a palloc'd copy that core
+will `pfree`):
+
 ```bash
-cargo build --release --features pg17 --no-default-features
+# PostgreSQL 17
+cargo build --release --no-default-features --features pg17
+# PostgreSQL 19
+cargo build --release --no-default-features --features pg19
 # then place the .so + SQL where your PG can see them, or:
-cargo pgrx install --pg17   # if pgrx-managed PG
+cargo pgrx install --pg17   # (or --pg19) if pgrx-managed PG
 ```
 
-Requires: PostgreSQL 17, pgrx 0.13.1, tantivy 0.24, jieba-rs 0.7.
+Requires: PostgreSQL **17 or 19**, pgrx **0.20**, tantivy 0.24, jieba-rs 0.7.
 
 ## Status
 
