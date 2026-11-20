@@ -9,10 +9,11 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = ["pg17"]
 pg17 = ["pgrx/pg17"]
+pg19 = ["pgrx/pg19"]
 pg_test = []
 
 [dependencies]
-pgrx = "=0.13.1"
+pgrx = "=0.20.0"
 tantivy = { version = "=0.24.2", default-features = false, features = ["mmap", "stopwords", "lz4-compression"] }
 jieba-rs = "0.7"
 unicode-normalization = "0.1"
@@ -28,7 +29,3 @@ panic = "unwind"
 
 [profile.release]
 panic = "unwind"
-
-[[bin]]
-name = "pgrx_embed_pgtantivy"
-path = "src/bin/pgrx_embed.rs"
