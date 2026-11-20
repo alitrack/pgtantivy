@@ -26,7 +26,7 @@ use tantivy::schema::{
 
 /// Minimal cost model: query-agnostic constant — BM25 top-N on a tantivy
 /// sidecar is sub-ms regardless of table size (mmap + inverted index).
-unsafe extern "C" fn amcostestimate(
+unsafe extern "C-unwind" fn amcostestimate(
     _root: *mut pg_sys::PlannerInfo,
     path: *mut pg_sys::IndexPath,
     _loop_count: f64,
@@ -111,42 +111,67 @@ CREATE OPERATOR CLASS pgtantivy_ops DEFAULT FOR TYPE text USING pgtantivy FAMILY
   OPERATOR 1 @@@ (text, text);
 ")]
 fn pgtantivy_am_handler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine> {
-    let amroutine = unsafe {
-        let n = pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexAmRoutine>())
-            as *mut pg_sys::IndexAmRoutine;
-        (*n).type_ = pg_sys::NodeTag::T_IndexAmRoutine;
-        n
-    };
-
-    unsafe {
+    // PG17-: heap-allocated IndexAmRoutine was tolerated. PG19+: core requires
+    // index AMs to allocate these structs statically ("the core code never
+    // copies nor frees them" — src/include/access/amapi.h), so the routine must
+    // live in a process-lifetime static, initialized once. PgBox::from_pg does
+    // not free on drop, so wrapping the static pointer is safe.
+    static AMROUTINE: std::sync::OnceLock<pg_sys::IndexAmRoutine> = std::sync::OnceLock::new();
+    let amroutine = AMROUTINE.get_or_init(|| {
+        let mut n: pg_sys::IndexAmRoutine = unsafe { std::mem::zeroed() };
+        n.type_ = pg_sys::NodeTag::T_IndexAmRoutine;
         // Strategy 1 = `@@@` (declared in the pgtantivy_ops operator family via
         // the pgrx-embedded SQL). amstrategies must cover it or the planner can
         // never form an index path — with 0, `body @@@ 'q'` degenerates to a seq
         // scan running the naive substring fallback per row (pit #10: measured
         // 91ms/q + 4/9 recall on the 100k bench vs 0.2ms/9/9 for the BM25 path).
-        (*amroutine).amstrategies = 1;
-        (*amroutine).amsupport = 0;
-        (*amroutine).amcanmulticol = false;
-        (*amroutine).amoptionalkey = true;
-        (*amroutine).amcanparallel = false;
-        (*amroutine).amkeytype = pg_sys::InvalidOid;
+        n.amstrategies = 1;
+        n.amsupport = 0;
+        n.amcanmulticol = false;
+        n.amoptionalkey = true;
+        n.amcanparallel = false;
+        n.amkeytype = pg_sys::InvalidOid;
 
-        (*amroutine).amvalidate = Some(validate as _);
-        (*amroutine).amoptions = Some(amoptions as _);
-        (*amroutine).amcostestimate = Some(amcostestimate as _);
-        (*amroutine).ambuild = Some(ambuild as _);
-        (*amroutine).ambuildempty = Some(ambuildempty as _);
-        (*amroutine).aminsert = Some(aminsert as _);
-        (*amroutine).ambulkdelete = Some(ambulkdelete as _);
-        (*amroutine).amvacuumcleanup = Some(amvacuumcleanup as _);
-        (*amroutine).ambeginscan = Some(ambeginscan as _);
-        (*amroutine).amrescan = Some(amrescan as _);
-        (*amroutine).amendscan = Some(amendscan as _);
-        (*amroutine).amgettuple = None; // bitmap-only for now
-        (*amroutine).amgetbitmap = Some(amgetbitmap as _);
+        n.amvalidate = Some(validate as _);
+        n.amoptions = Some(amoptions as _);
+        n.amcostestimate = Some(amcostestimate as _);
+        n.ambuild = Some(ambuild as _);
+        n.ambuildempty = Some(ambuildempty as _);
+        n.aminsert = Some(aminsert as _);
+        n.ambulkdelete = Some(ambulkdelete as _);
+        n.amvacuumcleanup = Some(amvacuumcleanup as _);
+        n.ambeginscan = Some(ambeginscan as _);
+        n.amrescan = Some(amrescan as _);
+        n.amendscan = Some(amendscan as _);
+        n.amgettuple = None; // bitmap-only for now
+        n.amgetbitmap = Some(amgetbitmap as _);
+        n
+    });
+
+    // PG17: core still pfrees the returned IndexAmRoutine during DefineIndex,
+    // so handing back a process-lifetime static crashes AllocSetFree (SIGSEGV on
+    // freeing a non-palloc chunk). Give PG17 a palloc'd copy, matching the
+    // pre-pgrx-0.20 behaviour. PG19: core never frees these structs, so the
+    // static is required and safe.
+    #[cfg(feature = "pg17")]
+    {
+        let dst = unsafe {
+            pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexAmRoutine>())
+                as *mut pg_sys::IndexAmRoutine
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                amroutine as *const pg_sys::IndexAmRoutine,
+                dst,
+                1,
+            );
+            PgBox::from_pg(dst)
+        }
     }
-
-    unsafe { PgBox::from_pg(amroutine) }
+    #[cfg(not(feature = "pg17"))]
+    unsafe {
+        PgBox::from_pg(std::ptr::from_ref(amroutine) as *mut pg_sys::IndexAmRoutine)
+    }
 }
 
 // ── amvalidate ───────────────────────────────────────────────────────────
@@ -155,7 +180,7 @@ fn pgtantivy_am_handler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::Inde
 /// reloptions, not by operators, so any opclass is accepted (PG requires
 /// amvalidate to exist; CREATE INDEX ... USING pgtantivy (col) will still pass
 /// a default opclass through).
-unsafe extern "C" fn validate(_opclassoid: pg_sys::Oid) -> bool {
+unsafe extern "C-unwind" fn validate(_opclassoid: pg_sys::Oid) -> bool {
     true
 }
 
@@ -266,7 +291,7 @@ unsafe fn read_reloptions(index_rel: pg_sys::Relation) -> (Option<String>, Optio
 }
 
 /// amoptions: parse/validate WITH (...) into our options struct (as bytea).
-unsafe extern "C" fn amoptions(reloptions: pg_sys::Datum, validate: bool) -> *mut pg_sys::bytea {
+unsafe extern "C-unwind" fn amoptions(reloptions: pg_sys::Datum, validate: bool) -> *mut pg_sys::bytea {
     let tbl = relopt_table();
     let r = pg_sys::build_reloptions(
         reloptions,
@@ -285,7 +310,25 @@ struct BuildState {
     n_docs: i64,
 }
 
-unsafe extern "C" fn ambuild(
+/// Fetch the i-th attribute descriptor from a TupleDesc.
+///
+/// PG19 moved the per-attribute array out of `TupleDescData` (which now holds a
+/// `compact_attrs` flexible array plus the FormData_pg_attribute array reached
+/// only through `TupleDescAttr()`), so the field access used on PG17 no longer
+/// compiles. pgrx 0.20 exposes `TupleDescAttr` as a C-shim binding for PG18+.
+#[inline]
+unsafe fn tupdesc_attr(tupdesc: pg_sys::TupleDesc, i: i32) -> pg_sys::FormData_pg_attribute {
+    #[cfg(feature = "pg19")]
+    {
+        *pg_sys::TupleDescAttr(tupdesc, i)
+    }
+    #[cfg(not(feature = "pg19"))]
+    {
+        (*tupdesc).attrs.as_slice((*tupdesc).natts as usize)[i as usize]
+    }
+}
+
+unsafe extern "C-unwind" fn ambuild(
     heap: pg_sys::Relation,
     index_rel: pg_sys::Relation,
     index_info: *mut pg_sys::IndexInfo,
@@ -303,7 +346,7 @@ unsafe extern "C" fn ambuild(
     let mut text_attn = -1i32;
     let mut id_attn = -1i32;
     for i in 0..natts {
-        let attr = (*tupdesc).attrs.as_slice(natts as usize)[i as usize];
+        let attr = tupdesc_attr(tupdesc, i);
         let name = std::ffi::CStr::from_ptr(attr.attname.data.as_ptr())
             .to_string_lossy()
             .into_owned();
@@ -432,7 +475,7 @@ unsafe extern "C" fn ambuild(
 /// Inserts are accepted (returning false = "not indexed here") so DML on the
 /// table is never blocked; run REINDEX to refresh, or use the trigger-based
 /// sync (pgtantivy_sync_trigger) for live updates on a sidecar name.
-unsafe extern "C" fn aminsert(
+unsafe extern "C-unwind" fn aminsert(
     _index_rel: pg_sys::Relation,
     _values: *mut pg_sys::Datum,
     _isnull: *mut bool,
@@ -445,7 +488,7 @@ unsafe extern "C" fn aminsert(
     false
 }
 
-unsafe extern "C" fn ambuildempty(_index_rel: pg_sys::Relation) {
+unsafe extern "C-unwind" fn ambuildempty(_index_rel: pg_sys::Relation) {
     // CREATE INDEX on an empty table: create an empty sidecar dir.
     let relname = std::ffi::CStr::from_ptr((*(*_index_rel).rd_rel).relname.data.as_ptr())
         .to_string_lossy()
@@ -457,7 +500,7 @@ unsafe extern "C" fn ambuildempty(_index_rel: pg_sys::Relation) {
 
 // ── vacuum (no-op; sidecar managed by create/merge lifecycle) ───────────
 
-unsafe extern "C" fn ambulkdelete(
+unsafe extern "C-unwind" fn ambulkdelete(
     _info: *mut pg_sys::IndexVacuumInfo,
     _stats: *mut pg_sys::IndexBulkDeleteResult,
     _callback: pg_sys::IndexBulkDeleteCallback,
@@ -466,7 +509,7 @@ unsafe extern "C" fn ambulkdelete(
     std::ptr::null_mut()
 }
 
-unsafe extern "C" fn amvacuumcleanup(
+unsafe extern "C-unwind" fn amvacuumcleanup(
     _info: *mut pg_sys::IndexVacuumInfo,
     _stats: *mut pg_sys::IndexBulkDeleteResult,
 ) -> *mut pg_sys::IndexBulkDeleteResult {
@@ -501,7 +544,7 @@ unsafe fn query_from_scankeys(scan: pg_sys::IndexScanDesc) -> Option<String> {
     Some(s)
 }
 
-unsafe extern "C" fn ambeginscan(
+unsafe extern "C-unwind" fn ambeginscan(
     index_rel: pg_sys::Relation,
     nkeys: i32,
     norderbys: i32,
@@ -510,7 +553,7 @@ unsafe extern "C" fn ambeginscan(
     r
 }
 
-unsafe extern "C" fn amrescan(
+unsafe extern "C-unwind" fn amrescan(
     scan: pg_sys::IndexScanDesc,
     keys: pg_sys::ScanKey,
     _nkeys: i32,
@@ -536,7 +579,7 @@ unsafe extern "C" fn amrescan(
     sd.xs_recheck = false;
 }
 
-unsafe extern "C" fn amendscan(scan: pg_sys::IndexScanDesc) {
+unsafe extern "C-unwind" fn amendscan(scan: pg_sys::IndexScanDesc) {
     let sd = &mut *scan;
     if !sd.opaque.is_null() {
         drop(Box::from_raw(sd.opaque as *mut AmScanState));
@@ -544,7 +587,7 @@ unsafe extern "C" fn amendscan(scan: pg_sys::IndexScanDesc) {
     }
 }
 
-unsafe extern "C" fn amgetbitmap(scan: pg_sys::IndexScanDesc, tbm: *mut pg_sys::TIDBitmap) -> i64 {
+unsafe extern "C-unwind" fn amgetbitmap(scan: pg_sys::IndexScanDesc, tbm: *mut pg_sys::TIDBitmap) -> i64 {
     let sd = &mut *scan;
     if sd.opaque.is_null() {
         return 0;

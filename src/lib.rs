@@ -7,7 +7,7 @@ use pgrx::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::{
@@ -30,8 +30,8 @@ pub mod snapshot;
 
 // GUC pgtantivy.index_dir: where persistent indexes live. Empty (the
 // default) resolves to $PGDATA/pgtantivy.
-static INDEX_DIR_GUC: GucSetting<Option<&'static CStr>> =
-    GucSetting::<Option<&'static CStr>>::new(None);
+static INDEX_DIR_GUC: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
 
 // GUC pgtantivy.merge_threshold: auto-compact after an incremental write
 // leaves this many searchable segments (0 = never; manual-only via
@@ -41,20 +41,20 @@ static MERGE_THRESHOLD_GUC: GucSetting<i32> = GucSetting::<i32>::new(8);
 #[allow(non_snake_case)]
 #[no_mangle]
 #[pg_guard]
-pub unsafe extern "C" fn _PG_init() {
+pub unsafe extern "C-unwind" fn _PG_init() {
     am::init_reloptions();
     GucRegistry::define_string_guc(
-        "pgtantivy.index_dir",
-        "Base directory for persistent pgtantivy indexes",
-        "Where pgtantivy stores persistent indexes. Empty = $PGDATA/pgtantivy.",
+        c"pgtantivy.index_dir",
+        c"Base directory for persistent pgtantivy indexes",
+        c"Where pgtantivy stores persistent indexes. Empty = $PGDATA/pgtantivy.",
         &INDEX_DIR_GUC,
         GucContext::Userset,
         GucFlags::default(),
     );
     GucRegistry::define_int_guc(
-        "pgtantivy.merge_threshold",
-        "Auto-merge segment threshold for incremental writes",
-        "After an incremental write, if the index has this many searchable segments or more it is auto-compacted. 0 disables (manual pgtantivy_merge only).",
+        c"pgtantivy.merge_threshold",
+        c"Auto-merge segment threshold for incremental writes",
+        c"After an incremental write, if the index has this many searchable segments or more it is auto-compacted. 0 disables (manual pgtantivy_merge only).",
         &MERGE_THRESHOLD_GUC,
         0,
         1024,
