@@ -123,6 +123,36 @@ cargo pgrx install --pg17   # (or --pg18 / --pg19) if pgrx-managed PG
 
 Requires: PostgreSQL **17, 18, or 19**, pgrx **0.20**, tantivy 0.24, jieba-rs 0.7.
 
+## Benchmark: pgtantivy vs Timescale `pg_textsearch` (v1.6.0)
+
+Both extensions run in the **same** PostgreSQL 17.12 cluster, on the same host (Apple M3 Ultra, aarch64, 32 vCPU), indexing the **same** data with a **matching no-stem tokenizer** (pg_textsearch `text_config='simple'` ≡ pgtantivy `language='english'` SimpleTokenizer+LowerCaser), so the measured gap is engine, not tokenization. Two corpus sizes were measured:
+
+**Cranfield** — 1,400 real aerodynamics abstracts, 225 real TREC queries, ×20 reps:
+
+| | pg_textsearch (C) | pgtantivy (Rust/tantivy) |
+|---|---|---|
+| build index | 105 ms | 87 ms |
+| index size | 901 KB | 600 KB |
+| ranked top-10 p50 / p95 / p99 | 0.131 / 0.224 / 0.340 ms | 0.066 / 0.111 / 0.138 ms |
+
+**MS MARCO** — 1,000,000 real passages, a stratified sample of 1,897 of the 101,093 dev queries, ×10 reps:
+
+| | pg_textsearch (C) | pgtantivy (Rust/tantivy) |
+|---|---|---|
+| build index | 13 s (2 workers) | 8 s |
+| index / sidecar size | 211 MB | 171 MB |
+| ranked top-10 p50 / p95 / p99 | 13.96 / 39.69 / 50.78 ms | 0.266 / 0.520 / 0.725 ms |
+| `@@@` boolean-filter p50 / p95 | — (no filter operator) | 0.004 / 0.004 ms |
+
+**Reading the numbers honestly:**
+
+- **Ranked top-10 at 1M** is the headline: pgtantivy is ~50× faster at p50 (13.96 ms → 0.266 ms). Two mechanisms, both verifiable in the query plans: pg_textsearch's ranked path is a **planner-driven `ORDER BY <@> … LIMIT k` Index Scan** — it re-enters the index per row for scoring; pgtantivy's path is a **single in-memory tantivy `TopDocs` search** over the mmap'd index (the sidecar stays in OS page cache), so the "search" is one native call that already returns the top-k, not a PG index scan materialising rows.
+- **The query *semantics* differ, so this is not a like-for-like relevance comparison.** `pg_textsearch <@>` scores a **disjunctive (OR/bag-of-words)** match and returns a score (negative, for `ASC`); it has **no boolean filter operator** — there is no `@@@`-equivalent, a `WHERE content <@> q` triggers a *standalone* (sequential) score, and the index is only used via `ORDER BY`. pgtantivy's `@@@` is a **conjunctive (AND)** boolean filter (a term must co-occur), and `pgtantivy_search(name, q, k)` is the ranked top-k. This is why, on the 225 TREC queries (avg ~15–24 words), pgtantivy's AND recall against a *disjunctive* reference is low while pg_textsearch's OR recall is high — a long multi-word query ANDs to ~0 documents in pgtantivy but OR-matches many in pg_textsearch. They are two different relevance models; the latency table above compares "give me the best 10 for this query" under each engine's native ranked path.
+- **nDCG@10 was not measured** on the 1M prefix subset: only 244 of the 7,437 official MS MARCO dev judgments reference a passage in the *first 1M* of the 8.8M-passage collection, and combined with the AND-vs-OR semantic mismatch the signal is not meaningful on a prefix. The 1M numbers above are latency/size, not a ranking-quality claim.
+- **CJK is a pgtantivy-only capability here.** `pg_textsearch` has no CJK tokenizer (it depends on a separately-installed external extension such as `zhparser`); pgtantivy ships `jieba` in-process (`language='chinese'`), so Chinese full-text works with no extra extension. Chinese was not put in the head-to-head (the tokenizer would differ); it is demonstrated separately, not benchmarked for speed against a non-existent equivalent.
+
+The `@@@` operator and `pgtantivy_search` both sanitise user input to alphanumerics before it reaches tantivy's `QueryParser`, so a real query containing `'` (`can't`), a range token (`y > x`), or other metacharacters degrades to a keyword search instead of throwing — see `src/lib.rs::sanitize`.
+
 ## Status
 
 **Drift detection** (snapshot staleness, research #2026111601 "漂移检测" line) — the index is a snapshot: after a build or incremental write, heap DML is not re-indexed (documented MVP contract), so staleness is *made visible* instead of silently wrong.
