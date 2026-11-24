@@ -38,8 +38,8 @@ static INDEX_DIR_GUC: GucSetting<Option<CString>> =
 // pgtantivy_merge). Default 8.
 static MERGE_THRESHOLD_GUC: GucSetting<i32> = GucSetting::<i32>::new(8);
 
-#[allow(non_snake_case)]
-#[no_mangle]
+// pgrx 0.20's #[pg_guard] emits its own #[unsafe(no_mangle)] (and
+// #[allow(non_snake_case)]) for _PG_init, so the explicit attribute is gone.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn _PG_init() {
     am::init_reloptions();
