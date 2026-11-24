@@ -1394,27 +1394,28 @@ fn nfc(s: &str) -> String {
 }
 
 pub(crate) fn sanitize(q: &str) -> String {
-    // tantivy QueryParser DSL metacharacters, mapped to a space so a
-    // query degrades to a conjunctive (AND) keyword search instead of a
-    // syntax error. Hex code points (not char literals) so the set is
-    // trivially auditable and unescapeable. 0x27 (the single quote) MUST
-    // be present: it is tantivy's string-literal delimiter, and a bare
-    // one (real English contractions "can't"/"it's"/"don't") otherwise
-    // throws `Syntax Error`. SimpleTokenizer already splits "can't" into
-    // the terms "can" + "t" at index time, so stripping the quote in the
-    // query matches how the document was tokenized. (0x22, the double
-    // quote, is stripped for the same reason - phrase operators are not
-    // supported.)
-    const DSL: [u32; 20] = [0x2B, 0x5E, 0x2D, 0x26, 0x7C, 0x21, 0x28, 0x29,
-        0x7B, 0x7D, 0x5B, 0x5D, 0x22, 0x7E, 0x2A, 0x3F, 0x3A, 0x5C, 0x2F, 0x27];
+    // Map every non-alphanumeric character to a space, so the text handed to
+    // tantivy's QueryParser can only contain space-separated alphanumeric
+    // "terms" and never a DSL construct.
+    //
+    // Why an allow-list and not a deny-list of metacharacters: the QueryParser
+    // has a large DSL surface (range `> < >= <= [ {`, set `IN`, phrase, prefix
+    // `~`, boost `^`, string-literal quote `' "`, ...). A deny-list keeps
+    // missing new operators, and each miss is a hard error (e.g. a bare `>`
+    // becomes an unbounded *range* on a text field -> "Range query need to
+    // target a specific field", and a bare `'` a Syntax Error). Real user
+    // queries hit these ("y > x", "can't", "..., FL").
+    //
+    // This is consistent with the index by construction: the SAME tokenizer
+    // (SimpleTokenizer for english / Jieba for chinese, + LowerCaser) tokenizes
+    // both the indexed documents and this query string, and it already
+    // discards every non-alphanumeric character. So stripping punctuation here
+    // cannot change which terms a query matches - it only removes characters
+    // the parser would otherwise interpret as operators. Unicode-aware
+    // (char::is_alphanumeric), so CJK ideographs are preserved for the jieba
+    // path and only Latin-script punctuation is stripped.
     q.chars()
-        .map(|c| {
-            if DSL.contains(&(c as u32)) {
-                ' '
-            } else {
-                c
-            }
-        })
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect()
 }
 
