@@ -1394,9 +1394,22 @@ fn nfc(s: &str) -> String {
 }
 
 pub(crate) fn sanitize(q: &str) -> String {
+    // tantivy QueryParser DSL metacharacters, mapped to a space so a
+    // query degrades to a conjunctive (AND) keyword search instead of a
+    // syntax error. Hex code points (not char literals) so the set is
+    // trivially auditable and unescapeable. 0x27 (the single quote) MUST
+    // be present: it is tantivy's string-literal delimiter, and a bare
+    // one (real English contractions "can't"/"it's"/"don't") otherwise
+    // throws `Syntax Error`. SimpleTokenizer already splits "can't" into
+    // the terms "can" + "t" at index time, so stripping the quote in the
+    // query matches how the document was tokenized. (0x22, the double
+    // quote, is stripped for the same reason - phrase operators are not
+    // supported.)
+    const DSL: [u32; 20] = [0x2B, 0x5E, 0x2D, 0x26, 0x7C, 0x21, 0x28, 0x29,
+        0x7B, 0x7D, 0x5B, 0x5D, 0x22, 0x7E, 0x2A, 0x3F, 0x3A, 0x5C, 0x2F, 0x27];
     q.chars()
         .map(|c| {
-            if "+^-&|!(){}[]^\"~*?:\\/".contains(c) {
+            if DSL.contains(&(c as u32)) {
                 ' '
             } else {
                 c
