@@ -12,7 +12,7 @@
 //! WAL/recovery contract unchanged (documented: REINDEX after crash).
 
 use crate::{
-    analyzer, index_root, lookup, nfc, now_millis, reader_docs, registry, sanitize,
+    analyzer, index_root, lookup, nfc, now_millis, registry, sanitize,
     write_build_meta, BuildAnchor, PgIndex, JIEBA_TOKENIZER,
 };
 use pgrx::prelude::*;
@@ -148,12 +148,12 @@ fn pgtantivy_am_handler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::Inde
         n
     });
 
-    // PG17: core still pfrees the returned IndexAmRoutine during DefineIndex,
-    // so handing back a process-lifetime static crashes AllocSetFree (SIGSEGV on
-    // freeing a non-palloc chunk). Give PG17 a palloc'd copy, matching the
-    // pre-pgrx-0.20 behaviour. PG19: core never frees these structs, so the
-    // static is required and safe.
-    #[cfg(feature = "pg17")]
+    // PG17 and PG18: core expects a palloc'd IndexAmRoutine and pfrees it during
+    // DefineIndex ("must be stored in a single palloc'd chunk" — amapi.h, both
+    // versions). Handing back a process-lifetime static would crash AllocSetFree
+    // (SIGSEGV freeing a non-palloc chunk), so copy the static into a fresh
+    // palloc'd chunk.
+    #[cfg(any(feature = "pg17", feature = "pg18"))]
     {
         let dst = unsafe {
             pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexAmRoutine>())
@@ -168,7 +168,10 @@ fn pgtantivy_am_handler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::Inde
             PgBox::from_pg(dst)
         }
     }
-    #[cfg(not(feature = "pg17"))]
+    // PG19: core never copies nor frees these structs (amapi.h: "the core code
+    // never copies nor frees them"; GetIndexAmRoutine returns const IndexAmRoutine*),
+    // so the process-lifetime static is required and safe.
+    #[cfg(feature = "pg19")]
     unsafe {
         PgBox::from_pg(std::ptr::from_ref(amroutine) as *mut pg_sys::IndexAmRoutine)
     }
@@ -243,6 +246,13 @@ unsafe fn ensure_relopt_kind(pgt_kind: *mut pg_sys::relopt_kind::Type) {
     }
 }
 
+// PG17 and PG19: relopt_parse_elt has { optname, opttype, offset }.
+// PG18 additionally has `isset_offset` (optional; only consulted when > 0).
+// Our string options use out-of-range defaults (0 = unset, per
+// GET_STRING_RELOPTION) so `isset_offset` stays 0 = "not used". The field is
+// spelled out explicitly rather than via `..Default::default()` because the
+// generated Default for these C structs is backed by MaybeUninit::uninit().
+#[cfg(not(feature = "pg18"))]
 fn relopt_table() -> [pg_sys::relopt_parse_elt; 3] {
     [
         pg_sys::relopt_parse_elt {
@@ -259,6 +269,29 @@ fn relopt_table() -> [pg_sys::relopt_parse_elt; 3] {
             optname: c"language".as_ptr(),
             opttype: pg_sys::relopt_type::RELOPT_TYPE_STRING,
             offset: std::mem::offset_of!(PgtantivyOpts, language_off) as i32,
+        },
+    ]
+}
+#[cfg(feature = "pg18")]
+fn relopt_table() -> [pg_sys::relopt_parse_elt; 3] {
+    [
+        pg_sys::relopt_parse_elt {
+            optname: c"text_column".as_ptr(),
+            opttype: pg_sys::relopt_type::RELOPT_TYPE_STRING,
+            offset: std::mem::offset_of!(PgtantivyOpts, text_column_off) as i32,
+            isset_offset: 0,
+        },
+        pg_sys::relopt_parse_elt {
+            optname: c"id_column".as_ptr(),
+            opttype: pg_sys::relopt_type::RELOPT_TYPE_STRING,
+            offset: std::mem::offset_of!(PgtantivyOpts, id_column_off) as i32,
+            isset_offset: 0,
+        },
+        pg_sys::relopt_parse_elt {
+            optname: c"language".as_ptr(),
+            opttype: pg_sys::relopt_type::RELOPT_TYPE_STRING,
+            offset: std::mem::offset_of!(PgtantivyOpts, language_off) as i32,
+            isset_offset: 0,
         },
     ]
 }
@@ -312,17 +345,18 @@ struct BuildState {
 
 /// Fetch the i-th attribute descriptor from a TupleDesc.
 ///
-/// PG19 moved the per-attribute array out of `TupleDescData` (which now holds a
+/// PG18+ moved the per-attribute array out of `TupleDescData` (which now holds a
 /// `compact_attrs` flexible array plus the FormData_pg_attribute array reached
 /// only through `TupleDescAttr()`), so the field access used on PG17 no longer
-/// compiles. pgrx 0.20 exposes `TupleDescAttr` as a C-shim binding for PG18+.
+/// compiles. pgrx 0.20 exposes `TupleDescAttr` as a C-shim binding for PG18 and
+/// PG19; PG17 still reads the inline `attrs` array directly.
 #[inline]
 unsafe fn tupdesc_attr(tupdesc: pg_sys::TupleDesc, i: i32) -> pg_sys::FormData_pg_attribute {
-    #[cfg(feature = "pg19")]
+    #[cfg(any(feature = "pg18", feature = "pg19"))]
     {
         *pg_sys::TupleDescAttr(tupdesc, i)
     }
-    #[cfg(not(feature = "pg19"))]
+    #[cfg(feature = "pg17")]
     {
         (*tupdesc).attrs.as_slice((*tupdesc).natts as usize)[i as usize]
     }

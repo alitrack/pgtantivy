@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = ["pg17"]
 pg17 = ["pgrx/pg17"]
+pg18 = ["pgrx/pg18"]
 pg19 = ["pgrx/pg19"]
 pg_test = []
 
