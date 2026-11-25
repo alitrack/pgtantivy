@@ -28,8 +28,11 @@ SELECT pgtantivy_load('docs_idx');   -- reload after restart / new session
 SELECT * FROM pgtantivy_list();      -- name, loaded, doc count
 SELECT pgtantivy_version();
 
--- BM25 search (AND semantics across words), top-k
+-- BM25 search (OR / bag-of-words across words by default — same model as PG's
+-- to_tsquery; each word contributes to the score), top-k
 SELECT id, score FROM pgtantivy_search('docs_idx', '量子 计算', 10);
+-- require every word to co-occur (precision filter): pass conjunctive = true
+SELECT id, score FROM pgtantivy_search('docs_idx', '量子 计算', 10, true);
 
 -- highlighted fragment with [HIGHLIGHT]...[/HIGHLIGHT] markers (Chinese-safe)
 SELECT pgtantivy_snippet('docs_idx', '量子比特', body) FROM docs WHERE doc_id = 1;
@@ -125,30 +128,35 @@ Requires: PostgreSQL **17, 18, or 19**, pgrx **0.20**, tantivy 0.24, jieba-rs 0.
 
 ## Benchmark: pgtantivy vs Timescale `pg_textsearch` (v1.6.0)
 
-Both extensions run in the **same** PostgreSQL 17.12 cluster, on the same host (Apple M3 Ultra, aarch64, 32 vCPU), indexing the **same** data with a **matching no-stem tokenizer** (pg_textsearch `text_config='simple'` ≡ pgtantivy `language='english'` SimpleTokenizer+LowerCaser), so the measured gap is engine, not tokenization. Two corpus sizes were measured:
+Both extensions run in the **same** PostgreSQL 17.12 cluster, on the same host (Apple M3 Ultra, aarch64, 32 vCPU), indexing the **same** data with a **matching no-stem tokenizer** (pg_textsearch `text_config='simple'` ≡ pgtantivy `language='english'` SimpleTokenizer+LowerCaser), so the measured gap is engine, not tokenization. Two corpus sizes were measured. As of **v0.6.0** `pgtantivy_search` defaults to **OR** (disjunction / bag-of-words) — the *same* relevance model `pg_textsearch <@>` uses — so the two are directly comparable; the former **AND** default is still available as `conjunctive = true`. (The `@@@` operator stays a conjunctive *filter*, unchanged.)
 
-**Cranfield** — 1,400 real aerodynamics abstracts, 225 real TREC queries, ×20 reps:
+**Cranfield** — 1,400 real aerodynamics abstracts, 225 real TREC queries, ×10 reps, one cluster, both engines:
 
-| | pg_textsearch (C) | pgtantivy (Rust/tantivy) |
-|---|---|---|
-| build index | 105 ms | 87 ms |
-| index size | 901 KB | 600 KB |
-| ranked top-10 p50 / p95 / p99 | 0.131 / 0.224 / 0.340 ms | 0.066 / 0.111 / 0.138 ms |
+| ranked top-10 | p50 | p95 | p99 |
+|---|---|---|---|
+| pg_textsearch (OR) | 0.133 ms | 0.229 ms | 0.348 ms |
+| pgtantivy **OR (new default)** | 0.091 ms | 0.166 ms | 0.204 ms |
+| pgtantivy AND (`conjunctive=true`, old default) | 0.052 ms | 0.100 ms | 0.178 ms |
 
 **MS MARCO** — 1,000,000 real passages, a stratified sample of 1,897 of the 101,093 dev queries, ×10 reps:
 
-| | pg_textsearch (C) | pgtantivy (Rust/tantivy) |
-|---|---|---|
-| build index | 13 s (2 workers) | 8 s |
-| index / sidecar size | 211 MB | 171 MB |
-| ranked top-10 p50 / p95 / p99 | 13.96 / 39.69 / 50.78 ms | 0.266 / 0.520 / 0.725 ms |
-| `@@@` boolean-filter p50 / p95 | — (no filter operator) | 0.004 / 0.004 ms |
+| ranked top-10 | p50 | p95 | p99 |
+|---|---|---|---|
+| pg_textsearch (OR)¹ | 13.96 ms | 39.69 ms | 50.78 ms |
+| pgtantivy **OR (new default)** | 7.36 ms | 15.27 ms | 18.67 ms |
+| pgtantivy AND (`conjunctive=true`, old default) | 0.26 ms | 0.50 ms | 0.68 ms |
+| pgtantivy `@@@` boolean-filter¹ (p50 / p95) | 0.004 / 0.004 ms | — | — |
+
+Index build / size (MS MARCO, unchanged from v0.5.0): pg_textsearch 13 s (2 workers) / 211 MB; pgtantivy 8 s / 171 MB.
+
+¹ Provenance: the two `pgtantivy` rows were **re-measured on the 0.6.0 build** (the OR/AND rows). The `pg_textsearch` and `@@@` rows are from the original v1.6.0 / v0.5.0 run on the same host, corpus, and tokenizer — pg_textsearch is a separate C codebase this change does not touch, and `@@@` is unchanged (conjunctive), so those numbers still hold. The `pg_textsearch <@>` path was not rebuilt here.
 
 **Reading the numbers honestly:**
 
-- **Ranked top-10 at 1M** is the headline: pgtantivy is ~50× faster at p50 (13.96 ms → 0.266 ms). Two mechanisms, both verifiable in the query plans: pg_textsearch's ranked path is a **planner-driven `ORDER BY <@> … LIMIT k` Index Scan** — it re-enters the index per row for scoring; pgtantivy's path is a **single in-memory tantivy `TopDocs` search** over the mmap'd index (the sidecar stays in OS page cache), so the "search" is one native call that already returns the top-k, not a PG index scan materialising rows.
-- **The query *semantics* differ, so this is not a like-for-like relevance comparison.** `pg_textsearch <@>` scores a **disjunctive (OR/bag-of-words)** match and returns a score (negative, for `ASC`); it has **no boolean filter operator** — there is no `@@@`-equivalent, a `WHERE content <@> q` triggers a *standalone* (sequential) score, and the index is only used via `ORDER BY`. pgtantivy's `@@@` is a **conjunctive (AND)** boolean filter (a term must co-occur), and `pgtantivy_search(name, q, k)` is the ranked top-k. This is why, on the 225 TREC queries (avg ~15–24 words), pgtantivy's AND recall against a *disjunctive* reference is low while pg_textsearch's OR recall is high — a long multi-word query ANDs to ~0 documents in pgtantivy but OR-matches many in pg_textsearch. They are two different relevance models; the latency table above compares "give me the best 10 for this query" under each engine's native ranked path.
-- **nDCG@10 was not measured** on the 1M prefix subset: only 244 of the 7,437 official MS MARCO dev judgments reference a passage in the *first 1M* of the 8.8M-passage collection, and combined with the AND-vs-OR semantic mismatch the signal is not meaningful on a prefix. The 1M numbers above are latency/size, not a ranking-quality claim.
+- **The like-for-like headline is pgtantivy-OR vs pg_textsearch-OR, ~1.9× at 1M** (7.36 ms vs 13.96 ms p50). Both use the disjunctive / bag-of-words model, so this is a true engine comparison. The mechanism is the same in both: pg_textsearch's ranked path is a **planner-driven `ORDER BY <@> … LIMIT k` Index Scan** that re-enters the index per row for scoring, while pgtantivy's path is a **single in-memory tantivy `TopDocs` search** over the mmap'd sidecar (one native call that already returns the top-k). The earlier "~50×" figure was **pgtantivy-AND vs pg_textsearch-OR** — two *different* relevance models, not a fair engine ratio.
+- **OR is faster than AND on real queries, for a reason you can see in the plans.** A multi-word query OR-matches far more documents than it AND-matches, so the OR path scores and ranks more candidates before it can return a top-10: at 1M that is 7.36 ms (OR) vs 0.26 ms (AND) p50. It is still far below pg_textsearch's 13.96 ms. The trade-off is a **recall** one, measured against the same reference (the committed Cranfield reference is disjunctive BM25): on the 225 TREC queries (avg ~15–24 words) pgtantivy **OR** recall@10 is **0.796** with **0** empty results, while the old **AND** default scored **0.004** and returned **221/225 empty** — a long multi-word query ANDs to ~0 docs. That asymmetry is exactly why 0.6.0 flips the default to OR (matching PG's `to_tsquery`/`plainto_tsquery`) and keeps AND behind `conjunctive=true` for precision-oriented filters.
+- **`@@@` is deliberately still a conjunctive filter** (a term must co-occur), so `WHERE body @@@ 'q'` is the boolean-filter path and `pgtantivy_search` is the ranked retrieval path; they answer different questions and each keeps its own model.
+- **nDCG@10 was not measured** on the 1M prefix subset: only 244 of the 7,437 official MS MARCO dev judgments reference a passage in the *first 1M* of the 8.8M-passage collection, so the signal is not meaningful on a prefix. The 1M numbers above are latency/size, not a ranking-quality claim.
 - **CJK is a pgtantivy-only capability here.** `pg_textsearch` has no CJK tokenizer (it depends on a separately-installed external extension such as `zhparser`); pgtantivy ships `jieba` in-process (`language='chinese'`), so Chinese full-text works with no extra extension. It is **demonstrated, not speed-benchmarked** (there is no CJK equivalent in `pg_textsearch` to time against). Verified out-of-box on a real cluster: a 6-doc Chinese corpus indexed with `language='chinese'` — `pgtantivy_search('zh_demo','中文分词',5)` returns the two docs containing it (jieba splits 中文/分词 as separate terms, so both match); `pgtantivy_snippet('zh_demo','中文分词', …)` returns `数据库扩展支持[HIGHLIGHT]中文[/HIGHLIGHT][HIGHLIGHT]分词[/HIGHLIGHT],无需外挂 zhparser,开箱即用`; `混合检索` and `搜索引擎` each return exactly their matching doc. The vector side of hybrid search (`pgtantivy_hybrid`) fuses BM25 with pgvector ANN via RRF and is validated at recall 1.000 / MRR 1.000 on a 90k-doc benchmark (README "Why").
 
 The `@@@` operator and `pgtantivy_search` both sanitise user input to alphanumerics before it reaches tantivy's `QueryParser`, so a real query containing `'` (`can't`), a range token (`y > x`), or other metacharacters degrades to a keyword search instead of throwing — see `src/lib.rs::sanitize`.
@@ -205,6 +213,12 @@ SELECT * FROM pgtantivy_search('docs_replica_s3dir', 'your query', 20);
 The same bundle published to S3 (each file an object under `<prefix>/<name>-<opstamp>.bundle/`, manifest uploaded last as the published marker). Import reuses the identical FNV integrity gate, so a corrupted/tampered S3 object is rejected. S3-side `keep` retains the N newest published versions. Auth is per-call (works against any S3-compatible store — verified on a real MinIO bucket, `tests/s3_e2e.py`): export → list → import → fresh-backend cross-node search 100/100 → independent minio-py object/manifest check → S3 keep=1 GC → corrupt-an-object rejection.
 
 **Shared index: approach 1 vs approach 2.** This repo ships **both**. **Approach 1** (`pgtantivy_import_from_s3`) is the whole-bundle-download path: it materializes the bundle to a temp dir, re-runs the FNV integrity gate, and `mmap`s it locally — production-ready (single-writer fence, monotonic opstamp versioning, FNV integrity, local + S3 retention). **Approach 2** (`pgtantivy_load_s3`) is the range-read optimization: it opens the S3 bundle **directly** through a custom tantivy `Directory` (`S3Directory` in `src/s3.rs`) so tantivy `range`-GETs only what each query touches, caching whole files per-process — **no whole-bundle download, no local index files**. A feasibility + quantification spike (`alitrack/pgtantivy-s3dir-spike`) measured, on a 231 KB / 10k-doc bundle, a single term query: approach 1 pulls **100%** of the bundle every read; approach 2 **COLD** first read pulls **23.2%** (24 range-GETs) and **WARM** (split cache primed) pulls **~1%** with **7.6× lower latency**. The one real risk is **cold-read RTT** (the COLD N range-GETs are N round-trips — invisible on a local MinIO, amplifying on remote S3); `pgtantivy_load_s3` mitigates this with a manifest-seeded length cache (no per-file `head` on the cold path) and an optional `warm_terms` pre-fetch (hot splits pulled at load, not on the first query). Remaining production hardening: **none** — the whole-file split cache is now bounded by an LRU byte budget (`PGTANTIVY_S3_CACHE_BYTES`, default 128 MiB, `0` = unbounded); a tiny budget degrades warm reads to re-fetching (slower, never wrong, never OOM). Pick approach 1 for small bundles / low read rate / same rack; use approach 2 when bundles are big, reads are frequent, or nodes cross availability zones. `load_s3` is verified end-to-end against a real MinIO bucket (`tests/s3dir_e2e.py`, 7 checks): export → `load_s3` range-read → **no local directory is created** (proof it is not a download) → cross-backend search 100/100 → `warm_terms` pre-fetch reports warmed + still 100 → **1KB LRU budget forces full eviction yet range-read stays 100/100** (memory ceiling holds).
+
+**v0.6.0** — ranked search defaults to OR (disjunction), AND behind an opt-in:
+
+- `pgtantivy_search` and `pgtantivy_snippet` gain a `conjunctive` boolean (default `false`). Multi-word queries are now composed with **OR / bag-of-words** by default — the same relevance model PG's `to_tsquery` / `plainto_tsquery` use, and the one `pg_textsearch <@>` uses — so the two engines are directly comparable. Pass `conjunctive = true` for the former AND (every word must co-occur) behavior. The `@@@` operator and the `pgtantivy_hybrid` FTS side follow the same default (hybrid also gained its own `conjunctive` param); `@@@` remains a conjunctive *filter* by design.
+- **Why the default flipped:** on the 225 Cranfield TREC queries (avg ~15–24 words) the old AND default scored recall@10 **0.004** and returned **221/225 empty results** — a long multi-word query ANDs to ~0 documents — while OR scores **0.796** with **0** empty results against the same (disjunctive) reference. The cost is real and is in the table above: at 1M, OR top-10 is 7.36 ms vs AND's 0.26 ms p50 (OR ranks more matched docs), which is why the like-for-like headline vs pg_textsearch is **~1.9×** (OR-vs-OR), not the old ~50× (AND-vs-OR, a different relevance model).
+- Benchmark section and usage examples updated to the 0.6.0 build (re-timed); the `pg_textsearch` and `@@@` rows are unchanged (separate C codebase / conjunctive filter, untouched by this change).
 
 **v0.5.0** — PostgreSQL 18 support + pgrx 0.20:
 

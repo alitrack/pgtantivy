@@ -42,6 +42,7 @@ fn pgtantivy_hybrid(
     vec_fetch: default!(i64, 50),
     top_k: default!(i64, 10),
     rrf_k: default!(i64, 60),
+    conjunctive: default!(bool, "false"),
 ) -> Result<
     TableIterator<
         'static,
@@ -63,10 +64,14 @@ fn pgtantivy_hybrid(
     let tk = top_k.max(1) as usize;
 
     // ── FTS side: BM25 over the named sidecar ────────────────────────────
+    // OR (disjunction) by default, matching pgtantivy_search; `conjunctive`
+    // ANDs all terms for precision-oriented filters.
     let idx = lookup(&fts_name)?;
     let searcher = idx.reader.searcher();
     let mut parser = QueryParser::for_index(&idx.index, vec![idx.body]);
-    parser.set_conjunction_by_default();
+    if conjunctive {
+        parser.set_conjunction_by_default();
+    }
     let parsed = parser
         .parse_query(&sanitize(&nfc(&fts_query)))
         .map_err(|e| format!("pgtantivy: bad query: {e}"))?;

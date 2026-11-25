@@ -1335,18 +1335,27 @@ fn pgtantivy_list(
     TableIterator::new(rows)
 }
 
-/// BM25 search over a named index. AND semantics, sanitized.
+/// BM25 search over a named index, sanitized.
+///
+/// Multi-term queries are composed with OR (disjunction) by default — the
+/// tantivy `QueryParser` default, and the same bag-of-words model PG's
+/// `to_tsquery`/`plainto_tsquery` use; each term contributes to the BM25
+/// score. Set `conjunctive` to AND all terms (the pre-0.6 default), e.g.
+/// for precision-oriented filters.
 #[pg_extern]
 fn pgtantivy_search(
     name: String,
     query: String,
     top_k: i64,
+    conjunctive: default!(bool, "false"),
 ) -> Result<TableIterator<'static, (name!(id, i64), name!(score, f64))>, Box<dyn std::error::Error>>
 {
     let idx = lookup(&name)?;
     let searcher = idx.reader.searcher();
     let mut parser = QueryParser::for_index(&idx.index, vec![idx.body]);
-    parser.set_conjunction_by_default();
+    if conjunctive {
+        parser.set_conjunction_by_default();
+    }
     let parsed = parser
         .parse_query(&sanitize(&nfc(&query)))
         .map_err(|e| format!("pgtantivy: bad query: {e}"))?;
@@ -1363,16 +1372,22 @@ fn pgtantivy_search(
 }
 
 /// Highlighted fragment (markers [HIGHLIGHT]/[/HIGHLIGHT]).
+///
+/// `conjunctive` mirrors `pgtantivy_search` (default OR); keep the two
+/// consistent for a query so the snippet highlights match the search.
 #[pg_extern]
 fn pgtantivy_snippet(
     name: String,
     query: String,
     text: String,
+    conjunctive: default!(bool, "false"),
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let idx = lookup(&name)?;
     let searcher = idx.reader.searcher();
     let mut parser = QueryParser::for_index(&idx.index, vec![idx.body]);
-    parser.set_conjunction_by_default();
+    if conjunctive {
+        parser.set_conjunction_by_default();
+    }
     let parsed = parser
         .parse_query(&sanitize(&nfc(&query)))
         .map_err(|e| format!("pgtantivy: bad query: {e}"))?;
