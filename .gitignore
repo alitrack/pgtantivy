@@ -3,5 +3,6 @@
 /target
 *.iml
 **/*.rs.bk
+*.so
 Cargo.lock
 __pycache__/
